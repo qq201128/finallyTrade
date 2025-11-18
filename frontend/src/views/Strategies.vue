@@ -207,9 +207,12 @@
           </el-col>
           <el-col :span="12">
             <el-form-item label="交易数量（可选）">
-              <el-input v-model="form.trade_amount" placeholder="每笔交易使用的USDT数量，如: 1">
+              <el-input v-model="form.trade_amount" placeholder="每笔交易使用的保证金（USDT），如: 20">
                 <template #append>USDT</template>
               </el-input>
+              <div style="color: #999; font-size: 12px; margin-top: 5px">
+                填写保证金数量，系统会根据杠杆自动计算名义价值
+              </div>
             </el-form-item>
           </el-col>
         </el-row>

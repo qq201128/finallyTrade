@@ -703,11 +703,15 @@ class BidirectionalTradingEngine:
         desired_leverage = self.user_strategy.config.get('leverage', 50) or 50
         
         try:
+            # 获取保证金（从用户配置中，trade_amount 现在代表保证金）
             try:
-                usdt_amount = float(self.user_strategy.trade_amount) if self.user_strategy.trade_amount else 0.001
+                margin_amount = float(self.user_strategy.trade_amount) if self.user_strategy.trade_amount else 0.001
             except (ValueError, TypeError):
-                usdt_amount = 0.001
+                margin_amount = 0.001
                 logger.warning(f"无法解析交易数量配置，使用默认值 0.001 USDT")
+            
+            # 计算名义价值：名义价值 = 保证金 × 杠杆
+            notional_value = margin_amount * desired_leverage
             
             try:
                 ticker = self.exchange_service.exchange.fetch_ticker(symbol)
@@ -724,10 +728,11 @@ class BidirectionalTradingEngine:
                 logger.error(f"无法获取 {symbol} 的价格，跳过开仓")
                 return
             
-            amount = usdt_amount / current_price
+            # 将名义价值转换为币种数量
+            amount = notional_value / current_price
             
             order_side = OrderSide.BUY if entry_side == 'long' else OrderSide.SELL
-            logger.info(f"创建{entry_side}仓订单: {symbol}, USDT数量: {usdt_amount}, 币种数量: {amount}, 价格: {current_price}")
+            logger.info(f"创建{entry_side}仓订单: {symbol}, 保证金: {margin_amount} USDT, 杠杆: {desired_leverage}x, 名义价值: {notional_value} USDT, 币种数量: {amount}, 价格: {current_price}")
             
             if not self.user_strategy.is_simulated:
                 try:
@@ -736,9 +741,10 @@ class BidirectionalTradingEngine:
                     logger.warning(f"设置 {symbol} 杠杆为 {desired_leverage}x 失败: {e}")
             
             if self.user_strategy.is_simulated:
-                logger.info(f"[模拟模式] 创建{entry_side}仓订单: {symbol}, USDT数量: {usdt_amount}, 币种数量: {amount}, 价格: {current_price}")
+                logger.info(f"[模拟模式] 创建{entry_side}仓订单: {symbol}, 保证金: {margin_amount} USDT, 杠杆: {desired_leverage}x, 名义价值: {notional_value} USDT, 币种数量: {amount}, 价格: {current_price}")
                 
-                cost = usdt_amount
+                # 计算成交金额（名义价值，即实际开仓价值）
+                cost = notional_value
                 order = Order(
                     user_id=self.user_strategy.user_id,
                     exchange_order_id=f"SIM_{datetime.now().timestamp()}",

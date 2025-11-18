@@ -58,25 +58,36 @@ def _get_candle_start_timestamp(timestamp: datetime, timeframe: str) -> datetime
 
 
 def _calculate_margin_used(position: Position) -> Optional[float]:
-    """计算持仓占用的保证金（按开仓成本）"""
+    """计算持仓占用的保证金（名义价值 / 杠杆）"""
     entry_price = position.entry_price or 0
     size = abs(position.size or 0)
-    if entry_price <= 0 or size <= 0:
-        return None
-    return entry_price * size
-
-
-def _calculate_pnl_percentage(position: Position) -> Optional[float]:
-    """计算未实现盈亏百分比"""
-    entry_price = position.entry_price or 0
-    size = abs(position.size or 0)
-    unrealized = position.unrealized_pnl
-    notional = entry_price * size
     leverage = position.leverage or 1
     if leverage <= 0:
         leverage = 1
-    if notional > 0 and unrealized is not None:
-        return (unrealized / notional) * leverage * 100
+    if entry_price <= 0 or size <= 0:
+        return None
+    # 保证金 = 名义价值 / 杠杆
+    notional = entry_price * size
+    margin = notional / leverage
+    return margin
+
+
+def _calculate_pnl_percentage(position: Position) -> Optional[float]:
+    """计算未实现盈亏百分比（基于保证金）"""
+    entry_price = position.entry_price or 0
+    size = abs(position.size or 0)
+    unrealized = position.unrealized_pnl
+    leverage = position.leverage or 1
+    if leverage <= 0:
+        leverage = 1
+    if entry_price <= 0 or size <= 0:
+        return None
+    # 计算保证金
+    notional = entry_price * size
+    margin_used = notional / leverage
+    # 盈亏百分比 = (未实现盈亏 / 保证金) * 100
+    if margin_used > 0 and unrealized is not None:
+        return (unrealized / margin_used) * 100
     return None
 
 

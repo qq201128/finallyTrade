@@ -687,14 +687,22 @@ class TradingEngine:
             return
         
         try:
-            # 获取买入金额（USDT数量，从用户配置中）
+            # 获取保证金（从用户配置中，trade_amount 现在代表保证金）
             try:
-                usdt_amount = float(self.user_strategy.trade_amount) if self.user_strategy.trade_amount else 0.001
+                margin_amount = float(self.user_strategy.trade_amount) if self.user_strategy.trade_amount else 0.001
             except (ValueError, TypeError):
-                usdt_amount = 0.001  # 默认值
+                margin_amount = 0.001  # 默认值
                 logger.warning(f"无法解析交易数量配置 '{self.user_strategy.trade_amount}'，使用默认值 0.001 USDT")
             
-            # 获取当前市场价格（用于将USDT数量转换为币种数量）
+            # 获取杠杆倍数（从配置中获取，默认1倍）
+            leverage = self.user_strategy.config.get('leverage', 1) or 1
+            if leverage <= 0:
+                leverage = 1
+            
+            # 计算名义价值：名义价值 = 保证金 × 杠杆
+            notional_value = margin_amount * leverage
+            
+            # 获取当前市场价格（用于将名义价值转换为币种数量）
             try:
                 ticker = self.exchange_service.exchange.fetch_ticker(symbol)
                 current_price = ticker.get('last', 0)
@@ -711,18 +719,18 @@ class TradingEngine:
                 logger.error(f"无法获取 {symbol} 的价格，跳过开仓")
                 return
             
-            # 将USDT数量转换为币种数量
-            # 币种数量 = USDT数量 / 当前价格
-            amount = usdt_amount / current_price
+            # 将名义价值转换为币种数量
+            # 币种数量 = 名义价值 / 当前价格
+            amount = notional_value / current_price
             
-            logger.info(f"交易配置: USDT数量={usdt_amount}, 当前价格={current_price}, 计算币种数量={amount}")
+            logger.info(f"交易配置: 保证金={margin_amount} USDT, 杠杆={leverage}x, 名义价值={notional_value} USDT, 当前价格={current_price}, 计算币种数量={amount}")
             
             # 如果是模拟模式，不实际下单，只记录日志
             if self.user_strategy.is_simulated:
-                logger.info(f"[模拟模式] 创建买入订单: {symbol}, USDT数量: {usdt_amount}, 币种数量: {amount}, 价格: {current_price}")
+                logger.info(f"[模拟模式] 创建买入订单: {symbol}, 保证金: {margin_amount} USDT, 杠杆: {leverage}x, 名义价值: {notional_value} USDT, 币种数量: {amount}, 价格: {current_price}")
                 
-                # 计算成交金额（实际使用的USDT）
-                cost = usdt_amount  # 使用配置的USDT数量
+                # 计算成交金额（名义价值，即实际开仓价值）
+                cost = notional_value  # 使用名义价值
                 
                 # 创建模拟订单记录
                 order = Order(
@@ -753,7 +761,7 @@ class TradingEngine:
                 return
             
             # 实际下单（使用币种数量）
-            logger.info(f"创建买入订单: {symbol}, USDT数量: {usdt_amount}, 币种数量: {amount}, 价格: {current_price}")
+            logger.info(f"创建买入订单: {symbol}, 保证金: {margin_amount} USDT, 杠杆: {leverage}x, 名义价值: {notional_value} USDT, 币种数量: {amount}, 价格: {current_price}")
             exchange_order = self.exchange_service.create_order(
                 symbol=symbol,
                 side='buy',
