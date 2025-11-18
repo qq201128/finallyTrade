@@ -13,12 +13,15 @@
 - SQLAlchemy（ORM）
 - SQLite/PostgreSQL（数据持久化）
 - WebSocket（实时数据推送）
+- APScheduler（任务调度）
 
 ### 前端
 - Vue 3
-- TradingView Lightweight Charts
+- Element Plus（UI组件库）
+- TradingView Lightweight Charts（图表库）
+- Vuex（状态管理）
+- Vue Router（路由）
 - Axios（HTTP客户端）
-- WebSocket客户端
 
 ## 系统架构
 
@@ -26,38 +29,66 @@
 backend/
 ├── app/
 │   ├── api/          # API路由
+│   │   ├── auth.py       # 用户认证
+│   │   ├── strategies.py # 策略管理
+│   │   ├── trades.py     # 交易相关
+│   │   └── websocket.py  # WebSocket
 │   ├── core/         # 核心配置
+│   │   ├── config.py     # 配置管理
+│   │   └── database.py   # 数据库连接
 │   ├── models/       # 数据库模型
+│   │   ├── user.py       # 用户模型
+│   │   ├── strategy.py   # 策略模型
+│   │   └── trade.py      # 交易模型
 │   ├── services/     # 业务逻辑
 │   │   ├── strategy_engine.py    # 策略引擎
 │   │   ├── trading_engine.py     # 交易执行引擎
-│   │   ├── exchange_service.py    # 交易所服务
+│   │   ├── exchange_service.py   # 交易所服务
+│   │   ├── trading_scheduler.py  # 任务调度
 │   │   └── user_service.py       # 用户服务
 │   ├── strategies/   # 策略文件目录
+│   │   ├── base_strategy.py      # 策略基类
+│   │   └── *.py                  # 自定义策略文件
 │   └── main.py       # 应用入口
 ├── requirements.txt
-└── config.py
+├── init_db.py        # 数据库初始化
+└── run.py            # 启动脚本
 
 frontend/
 ├── src/
-│   ├── components/   # Vue组件
 │   ├── views/        # 页面视图
+│   │   ├── Login.vue
+│   │   ├── Register.vue
+│   │   ├── Dashboard.vue
+│   │   ├── Strategies.vue
+│   │   ├── Positions.vue
+│   │   ├── Orders.vue
+│   │   └── Chart.vue
+│   ├── store/        # Vuex状态管理
 │   ├── services/     # API服务
-│   └── main.js
+│   ├── router/       # 路由配置
+│   └── main.js       # 应用入口
 └── package.json
 ```
 
-## 系统逻辑流程
+## 核心功能
 
-1. 从持久化存储中获取未平仓交易
-2. 计算当前可交易的交易对列表
-3. 下载交易对列表的OHLCV数据（每个K线周期仅执行一次）
-4. 调用策略回调函数（与货币对无关的计算）
-5. 按交易对分析策略（入场和出场信号）
-6. 从交易所更新交易的挂单状态（order_filled回调）
-7. 验证现有持仓并视情况下达卖出平仓订单
-8. 仓位调整（如启用）
-9. 验证买入信号，尝试开立新仓位
+### 后端功能
+- ✅ 用户认证系统（注册、登录、JWT Token）
+- ✅ 策略管理系统（动态加载、多用户多策略）
+- ✅ 交易所集成（CCXT，支持代理和WebSocket）
+- ✅ 交易执行引擎（9步交易循环逻辑）
+- ✅ 数据持久化（SQLite/PostgreSQL）
+- ✅ WebSocket实时推送
+- ✅ 任务调度（APScheduler）
+
+### 前端功能
+- ✅ 用户界面（登录、注册、仪表盘）
+- ✅ 策略管理页面
+- ✅ 持仓管理页面
+- ✅ 订单管理页面
+- ✅ TradingView图表展示
+- ✅ WebSocket实时数据更新
 
 ## 快速开始
 
@@ -68,92 +99,46 @@ frontend/
 
 ### 后端启动
 
-1. 创建并激活虚拟环境（推荐）
+1. **创建并激活虚拟环境**
 
 **Windows系统：**
 ```bash
 cd backend
-# 创建虚拟环境
 python -m venv venv
-
-# 激活虚拟环境
 venv\Scripts\activate
 ```
 
 **Linux/Mac系统：**
 ```bash
 cd backend
-# 创建虚拟环境
 python3 -m venv venv
-
-# 激活虚拟环境
 source venv/bin/activate
 ```
 
-激活成功后，命令行提示符前会显示 `(venv)`。
-
-**自动激活虚拟环境的方法：**
-
-**方法1：使用启动脚本（推荐）**
-- Windows CMD: 双击 `activate_env.bat` 或 `start_backend.bat`
-- PowerShell: 运行 `.\activate_env.ps1` 或 `.\start_backend.ps1`
-
-**方法2：配置 PowerShell Profile（永久自动激活）**
-```powershell
-# 查看 Profile 路径
-$PROFILE
-
-# 如果文件不存在，创建它
-if (!(Test-Path -Path $PROFILE)) {
-    New-Item -ItemType File -Path $PROFILE -Force
-}
-
-# 添加自动激活脚本（编辑 $PROFILE 文件）
-# 在文件末尾添加：
-# Set-Location D:\Desktop\finallyTrade\backend
-# & "D:\Desktop\finallyTrade\backend\venv\Scripts\Activate.ps1"
-```
-
-**方法3：创建快捷方式**
-- 右键 `start_backend.bat` → 创建快捷方式
-- 将快捷方式放到桌面或任务栏，双击即可启动
-
-2. 安装依赖
+2. **安装依赖**
 ```bash
 pip install -r requirements.txt
 ```
 
-3. 配置环境变量（可选）
-
-**Windows系统：**
+3. **配置环境变量（可选）**
 ```bash
-cd backend
-copy .env.example .env
-# 然后编辑 .env 文件，配置代理等参数
+# 复制环境变量模板
+copy .env.example .env  # Windows
+# cp .env.example .env  # Linux/Mac
+
+# 编辑 .env 文件，配置：
+# - SECRET_KEY: JWT密钥
+# - DATABASE_URL: 数据库连接
+# - PROXY_URL: 代理配置（可选）
+# - WS_ENABLED: WebSocket支持
 ```
 
-**Linux/Mac系统：**
-```bash
-cd backend
-cp .env.example .env
-# 然后编辑 .env 文件，配置代理等参数
-```
-
-**重要配置项说明：**
-- `SECRET_KEY`: JWT密钥，生产环境必须修改为强随机字符串（至少32个字符）
-- `DEBUG`: 调试模式，生产环境设置为 `False`
-- `DATABASE_URL`: 数据库连接，默认使用SQLite
-- `PROXY_URL` 或 `HTTP_PROXY`/`HTTPS_PROXY`: 代理配置（可选，如不需要可保持注释状态）
-- `WS_ENABLED`: WebSocket支持，默认 `True`
-
-详细配置说明请参考 `backend/.env.example` 文件中的注释。
-
-4. 初始化数据库
+4. **初始化数据库**
 ```bash
 python init_db.py
 ```
 
-5. 启动服务
+5. **启动服务**
 ```bash
 python run.py
 # 或使用 uvicorn
@@ -162,13 +147,13 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ### 前端启动
 
-1. 安装依赖
+1. **安装依赖**
 ```bash
 cd frontend
 npm install
 ```
 
-2. 启动开发服务器
+2. **启动开发服务器**
 ```bash
 npm run serve
 ```
@@ -190,22 +175,28 @@ npm run serve
   - 配置策略参数（可选）
 
 ### 3. 编写自定义策略
-在 `backend/app/strategies/` 目录下创建Python策略文件，参考 `example_strategy.py` 或 `talib_example_strategy.py`（使用TA-Lib技术指标）。
 
-策略文件需要实现以下函数：
+在 `backend/app/strategies/` 目录下创建Python策略文件，参考示例策略。
+
+**必须实现的函数：**
 - `populate_indicators(dataframe, metadata)`: 填充指标
 - `populate_entry_trend(dataframe, metadata)`: 入场信号
 - `populate_exit_trend(dataframe, metadata)`: 出场信号
-- `before_loop(symbols)`: 循环开始前回调（可选）
-- `after_loop(symbols)`: 循环结束后回调（可选）
-- `order_filled(order, exchange_order)`: 订单成交回调（可选）
-- `entry_conditions(symbol, analysis_result)`: 入场条件检查（可选）
-- `custom_exit(position, current_price)`: 自定义退出（可选）
-- `adjust_position(position)`: 仓位调整（可选）
 
-### 4. 系统逻辑流程
+**可选实现的函数：**
+- `before_loop(symbols)`: 循环开始前回调
+- `after_loop(symbols)`: 循环结束后回调
+- `order_filled(order, exchange_order)`: 订单成交回调
+- `entry_conditions(symbol, analysis_result)`: 入场条件检查
+- `custom_exit(position, current_price)`: 自定义退出
+- `adjust_position(position)`: 仓位调整
 
-系统按照以下流程自动执行交易：
+**策略基类：**
+策略可以继承 `BaseStrategy` 基类来复用公共方法，也可以选择重写特定方法。
+
+### 4. 系统交易流程
+
+系统按照以下9步循环执行（每5分钟一次）：
 
 1. **获取未平仓交易** - 从数据库加载当前持仓
 2. **计算可交易对列表** - 从交易所获取永续合约交易对
@@ -216,8 +207,6 @@ npm run serve
 7. **验证并平仓** - 检查止损、止盈、ROI、卖出信号，下达平仓订单
 8. **仓位调整** - 如果启用，检查是否需要追加订单
 9. **验证并开仓** - 检查买入信号，尝试开立新仓位
-
-循环每5分钟执行一次（可在 `trading_scheduler.py` 中配置）。
 
 ### 5. 查看交易数据
 - **仪表盘**: 查看持仓数量、盈亏、策略状态
@@ -243,7 +232,18 @@ SOCKS_PROXY=socks5://proxy.example.com:1080
 WS_ENABLED=True
 ```
 
-根据[CCXT Pro官方文档](https://github.com/ccxt/ccxt/wiki/ccxt.pro.manual)，CCXT Pro是CCXT的免费部分，用于添加WebSocket流式支持。
+### 数据库配置
+```
+DATABASE_URL=sqlite:///./trading_system.db
+# 或 PostgreSQL
+DATABASE_URL=postgresql://user:password@localhost/dbname
+```
+
+## API文档
+
+启动后端服务后，访问：
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
 
 ## 注意事项
 
@@ -253,11 +253,16 @@ WS_ENABLED=True
 4. **网络稳定**: 确保网络连接稳定，避免订单执行失败
 5. **数据备份**: 定期备份数据库，防止数据丢失
 
-## 技术架构
+## 开发计划
 
-- **后端**: FastAPI + SQLAlchemy + CCXT
-- **前端**: Vue 3 + Element Plus + TradingView Lightweight Charts
-- **数据库**: SQLite（可切换为PostgreSQL）
-- **任务调度**: APScheduler
-- **实时通信**: WebSocket
+- [ ] API密钥加密存储
+- [ ] 策略回测功能
+- [ ] 更完善的错误处理和重试机制
+- [ ] 更详细的日志和监控
+- [ ] 性能优化（异步处理、缓存优化）
+- [ ] 单元测试和集成测试
+- [ ] Docker容器化部署
 
+## 许可证
+
+MIT License
