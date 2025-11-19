@@ -180,13 +180,13 @@ class ExchangeService:
                         # 确保URL格式正确（移除末尾的斜杠，避免拼接问题）
                         proxy_value = proxy_value.rstrip('/')
                         config[key] = proxy_value
-                        logger.info(f"设置代理配置: {key} = {proxy_value}")
+                        # logger.info(f"设置代理配置: {key} = {proxy_value}")
                     else:
                         config[key] = value
         
         try:
             exchange = exchange_class(config)
-            logger.info(f"交易所 {self.exchange_name} 初始化成功")
+            # logger.info(f"交易所 {self.exchange_name} 初始化成功")
             return exchange
         except Exception as e:
             logger.error(f"交易所 {self.exchange_name} 初始化失败: {e}")

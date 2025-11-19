@@ -27,9 +27,9 @@ class UserStrategy(Base):
     __tablename__ = "user_strategies"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)  # 添加索引
     strategy_id = Column(Integer, ForeignKey("strategies.id"), nullable=False)
-    is_enabled = Column(Boolean, default=True)  # 用户是否启用该策略
+    is_enabled = Column(Boolean, default=True, index=True)  # 用户是否启用该策略，添加索引
     config = Column(JSON, default={})  # 用户自定义策略配置
     exchange = Column(String, nullable=False)  # 交易所名称
     api_key = Column(String)  # 用户交易所API Key（加密存储）
@@ -56,13 +56,13 @@ class StrategyHistory(Base):
     __tablename__ = "strategy_history"
     
     id = Column(Integer, primary_key=True, index=True)
-    user_strategy_id = Column(Integer, ForeignKey("user_strategies.id"), nullable=False)
-    started_at = Column(DateTime(timezone=True), nullable=False)  # 启动时间
+    user_strategy_id = Column(Integer, ForeignKey("user_strategies.id"), nullable=False, index=True)  # 添加索引
+    started_at = Column(DateTime(timezone=True), nullable=False, index=True)  # 启动时间，添加索引
     stopped_at = Column(DateTime(timezone=True))  # 停止时间（如果还在运行则为None）
     total_realized_pnl = Column(Float, default=0.0)  # 该期间的总已实现盈亏
     total_trades = Column(Integer, default=0)  # 该期间的总交易次数
     total_positions = Column(Integer, default=0)  # 该期间的总持仓数
-    is_running = Column(Boolean, default=True)  # 是否还在运行中
+    is_running = Column(Boolean, default=True, index=True)  # 是否还在运行中，添加索引
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

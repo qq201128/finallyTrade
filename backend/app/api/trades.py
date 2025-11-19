@@ -20,10 +20,11 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# 价格缓存：{symbol: (price, timestamp)}
+# 价格缓存优化：{symbol: (price, timestamp, exchange)}
 _price_cache: Dict[str, tuple] = {}
 _cache_lock = Lock()
-CACHE_TTL = 5  # 缓存5秒
+CACHE_TTL = 10  # 缓存10秒（提高TTL减少API调用）
+MAX_CACHE_SIZE = 1000  # 最大缓存条目数，防止内存溢出
 
 router = APIRouter(prefix="/api/trades", tags=["trades"])
 
@@ -143,21 +144,44 @@ class PnLResponse(BaseModel):
 
 
 def _get_cached_price(symbol: str) -> Optional[float]:
-    """从缓存获取价格"""
+    """从缓存获取价格（优化：支持过期清理）"""
+    current_time = time.time()
     with _cache_lock:
         if symbol in _price_cache:
-            price, timestamp = _price_cache[symbol]
-            if time.time() - timestamp < CACHE_TTL:
+            price, timestamp, _ = _price_cache[symbol]
+            if current_time - timestamp < CACHE_TTL:
                 return price
             else:
+                # 过期，删除
                 del _price_cache[symbol]
         return None
 
 
-def _set_cached_price(symbol: str, price: float):
-    """设置价格缓存"""
+def _set_cached_price(symbol: str, price: float, exchange: str = ""):
+    """设置价格缓存（优化：限制缓存大小，定期清理过期项）"""
+    current_time = time.time()
     with _cache_lock:
-        _price_cache[symbol] = (price, time.time())
+        # 如果缓存过大，清理最旧的条目
+        if len(_price_cache) >= MAX_CACHE_SIZE:
+            # 清理过期项
+            expired_keys = [
+                key for key, (_, timestamp, _) in _price_cache.items()
+                if current_time - timestamp >= CACHE_TTL
+            ]
+            for key in expired_keys:
+                del _price_cache[key]
+            
+            # 如果清理后仍然过大，删除最旧的20%
+            if len(_price_cache) >= MAX_CACHE_SIZE:
+                sorted_items = sorted(
+                    _price_cache.items(),
+                    key=lambda x: x[1][1]  # 按timestamp排序
+                )
+                items_to_remove = len(sorted_items) // 5  # 删除20%
+                for key, _ in sorted_items[:items_to_remove]:
+                    del _price_cache[key]
+        
+        _price_cache[symbol] = (price, current_time, exchange)
 
 
 async def _fetch_ticker_price(exchange_service: ExchangeService, symbol: str) -> Optional[float]:
@@ -176,7 +200,7 @@ async def _fetch_ticker_price(exchange_service: ExchangeService, symbol: str) ->
         current_price = ticker.get('last', 0)
         
         if current_price and current_price > 0:
-            _set_cached_price(symbol, current_price)
+            _set_cached_price(symbol, current_price, exchange_service.exchange.id if hasattr(exchange_service, 'exchange') else "")
             return current_price
         return None
     except Exception as e:
@@ -472,7 +496,7 @@ async def get_positions_history(
     db: Session = Depends(get_db),
     limit: int = 100
 ):
-    """获取用户持仓历史记录（已平仓的持仓）"""
+    """获取用户持仓历史记录（已平仓的持仓，优化：批量查询PnL记录）"""
     from sqlalchemy import func
     from datetime import timedelta
     
@@ -483,13 +507,22 @@ async def get_positions_history(
         Position.closed_at.isnot(None)
     ).order_by(Position.closed_at.desc()).limit(limit).all()
     
+    # 批量获取所有持仓的PnL记录，避免N+1查询
+    position_ids = [pos.id for pos in positions]
+    pnl_records_map = {}
+    if position_ids:
+        pnl_records = db.query(PnLRecord).filter(
+            PnLRecord.position_id.in_(position_ids)
+        ).all()
+        for pnl in pnl_records:
+            # 每个持仓可能有多条PnL记录，取第一条（或可以聚合）
+            if pnl.position_id not in pnl_records_map:
+                pnl_records_map[pnl.position_id] = pnl
+    
     result = []
     for position in positions:
-        # 获取该持仓的已实现盈亏
-        pnl_record = db.query(PnLRecord).filter(
-            PnLRecord.position_id == position.id
-        ).first()
-        
+        # 从映射中获取已实现盈亏
+        pnl_record = pnl_records_map.get(position.id)
         realized_pnl = pnl_record.realized_pnl if pnl_record else None
         
         # 计算持仓持续时间
@@ -535,11 +568,31 @@ async def get_orders(
     db: Session = Depends(get_db),
     status: str = None
 ):
-    """获取用户订单"""
+    """获取用户订单（优化：使用joinedload避免N+1查询）"""
+    from sqlalchemy.orm import joinedload
+    
     query = db.query(Order).filter(Order.user_id == current_user.id)
     if status:
         query = query.filter(Order.status == status)
-    orders = query.order_by(Order.created_at.desc()).limit(100).all()
+    # 使用joinedload预加载关联数据，避免N+1查询
+    orders = query.options(
+        joinedload(Order.position).joinedload(Position.user_strategy)
+    ).order_by(Order.created_at.desc()).limit(100).all()
+    
+    # 批量获取所有需要的position_id和PnL记录
+    position_ids = [order.position_id for order in orders if order.position_id]
+    pnl_records_map = {}
+    if position_ids:
+        # 一次性查询所有相关的PnL记录
+        pnl_records = db.query(PnLRecord).filter(
+            PnLRecord.position_id.in_(position_ids)
+        ).order_by(PnLRecord.closed_at.desc()).all()
+        
+        # 按position_id和size建立映射
+        for pnl in pnl_records:
+            key = (pnl.position_id, pnl.size)
+            if key not in pnl_records_map:
+                pnl_records_map[key] = pnl
     
     # 为每个订单添加盈亏信息（如果是平仓订单）
     result = []
@@ -561,23 +614,20 @@ async def get_orders(
         
         # 如果是平仓订单（有position_id），查找对应的盈亏记录
         if order.position_id:
-            position = db.query(Position).filter(Position.id == order.position_id).first()
-            if position:
-                # 查找该持仓的盈亏记录（可能有多条，取最新的）
-                pnl_record = db.query(PnLRecord).filter(
-                    PnLRecord.position_id == position.id,
-                    PnLRecord.size == order.filled  # 匹配订单成交数量
-                ).order_by(PnLRecord.closed_at.desc()).first()
-                
-                if not pnl_record:
-                    # 如果没有精确匹配，取该持仓最新的盈亏记录
-                    pnl_record = db.query(PnLRecord).filter(
-                        PnLRecord.position_id == position.id
-                    ).order_by(PnLRecord.closed_at.desc()).first()
-                
-                if pnl_record:
-                    order_data["realized_pnl"] = pnl_record.realized_pnl
-                    order_data["pnl_percentage"] = pnl_record.pnl_percentage
+            # 先尝试精确匹配（position_id + filled）
+            key = (order.position_id, order.filled)
+            pnl_record = pnl_records_map.get(key)
+            
+            if not pnl_record:
+                # 如果没有精确匹配，查找该持仓最新的盈亏记录
+                for (pos_id, size), pnl in pnl_records_map.items():
+                    if pos_id == order.position_id:
+                        pnl_record = pnl
+                        break
+            
+            if pnl_record:
+                order_data["realized_pnl"] = pnl_record.realized_pnl
+                order_data["pnl_percentage"] = pnl_record.pnl_percentage
         
         result.append(order_data)
     

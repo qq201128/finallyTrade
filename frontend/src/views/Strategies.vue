@@ -1,6 +1,12 @@
 <template>
   <div class="strategies">
-    <h1>策略管理</h1>
+    <div class="strategies-header">
+      <h1 class="page-title">
+        <el-icon :size="28" style="margin-right: 12px"><Setting /></el-icon>
+        策略管理
+      </h1>
+      <p class="page-subtitle">配置和管理您的交易策略</p>
+    </div>
     
     <el-tabs v-model="activeTab">
       <el-tab-pane label="系统策略" name="system">
@@ -245,9 +251,13 @@ import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { useStore } from 'vuex'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/services/api'
+import { Setting } from '@element-plus/icons-vue'
 
 export default {
   name: 'Strategies',
+  components: {
+    Setting
+  },
   setup() {
     const store = useStore()
     const activeTab = ref('user')
@@ -514,6 +524,30 @@ export default {
 </script>
 
 <style scoped>
+.strategies {
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.strategies-header {
+  margin-bottom: 24px;
+}
+
+.page-title {
+  display: flex;
+  align-items: center;
+  font-size: 28px;
+  font-weight: 600;
+  color: #303133;
+  margin: 0 0 8px 0;
+}
+
+.page-subtitle {
+  color: #909399;
+  font-size: 14px;
+  margin: 0;
+}
+
 .profit {
   color: #67c23a;
   font-weight: bold;
@@ -523,15 +557,23 @@ export default {
   color: #f56c6c;
   font-weight: bold;
 }
-</style>
-
-<style scoped>
-.strategies {
-  padding: 20px;
-}
 
 :deep(.strategy-dialog .el-form-item__label) {
   white-space: nowrap;
+}
+
+:deep(.el-tabs__header) {
+  margin-bottom: 20px;
+}
+
+:deep(.el-tabs__item) {
+  font-weight: 500;
+  font-size: 15px;
+}
+
+:deep(.el-table) {
+  border-radius: 8px;
+  overflow: hidden;
 }
 </style>
 

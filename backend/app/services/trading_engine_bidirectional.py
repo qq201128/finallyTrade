@@ -921,17 +921,17 @@ class BidirectionalTradingEngine:
     
     def run_trading_loop(self):
         """执行交易循环（支持双向交易）"""
-        logger.info(f"开始双向交易循环: 用户策略 {self.user_strategy.id}")
+        # logger.info(f"开始双向交易循环: 用户策略 {self.user_strategy.id}")
         
         try:
             open_positions = self.get_open_positions()
-            logger.info(f"当前未平仓交易数: {len(open_positions)} (多头: {len([p for p in open_positions if p.side == 'long'])}, "
-                       f"空头: {len([p for p in open_positions if p.side == 'short'])})")
+            # logger.info(f"当前未平仓交易数: {len(open_positions)} (多头: {len([p for p in open_positions if p.side == 'long'])}, "
+            #            f"空头: {len([p for p in open_positions if p.side == 'short'])})")
             
             self.update_positions_prices()
             
             tradable_symbols = self.get_tradable_symbols()
-            logger.info(f"可交易对数量: {len(tradable_symbols)}")
+            # logger.info(f"可交易对数量: {len(tradable_symbols)}")
             
             self.call_strategy_callback('before_loop', tradable_symbols)
             

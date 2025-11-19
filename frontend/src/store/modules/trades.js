@@ -5,7 +5,9 @@ const state = {
   positions: [],  // 持仓列表
   orders: [],     // 订单列表
   pnlRecords: [],  // 盈亏记录
-  totalRealizedPnl: 0  // 总已实现盈亏
+  totalRealizedPnl: 0,  // 总已实现盈亏
+  loadingPositions: false,  // 加载状态标记，防止重复请求
+  loadingOrders: false
 }
 
 const mutations = {
@@ -15,6 +17,12 @@ const mutations = {
       return
     }
     state.positions = positions
+  },
+  SET_LOADING_POSITIONS(state, loading) {
+    state.loadingPositions = loading
+  },
+  SET_LOADING_ORDERS(state, loading) {
+    state.loadingOrders = loading
   },
   UPDATE_POSITIONS(state, positions) {
     // WebSocket 推送的持仓更新（通常是部分更新）
@@ -103,24 +111,40 @@ const mutations = {
 }
 
 const actions = {
-  async fetchPositions({ commit }, fast = true) {
+  async fetchPositions({ commit, state }, fast = true) {
+    // 如果正在加载，避免重复请求
+    if (state.loadingPositions) {
+      return Promise.resolve()
+    }
+    
     try {
+      commit('SET_LOADING_POSITIONS', true)
       const response = await api.get('/trades/positions', { 
         params: { fast: fast } 
       })
       commit('SET_POSITIONS', response.data)
     } catch (error) {
       console.error('获取持仓失败:', error)
+    } finally {
+      commit('SET_LOADING_POSITIONS', false)
     }
   },
   
-  async fetchOrders({ commit }, status = null) {
+  async fetchOrders({ commit, state }, status = null) {
+    // 如果正在加载，避免重复请求
+    if (state.loadingOrders) {
+      return Promise.resolve()
+    }
+    
     try {
+      commit('SET_LOADING_ORDERS', true)
       const params = status ? { status } : {}
       const response = await api.get('/trades/orders', { params })
       commit('SET_ORDERS', response.data)
     } catch (error) {
       console.error('获取订单失败:', error)
+    } finally {
+      commit('SET_LOADING_ORDERS', false)
     }
   },
   

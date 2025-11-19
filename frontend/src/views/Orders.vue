@@ -1,6 +1,12 @@
 <template>
   <div class="orders">
-    <h1>订单管理</h1>
+    <div class="orders-header">
+      <h1 class="page-title">
+        <el-icon :size="28" style="margin-right: 12px"><List /></el-icon>
+        订单管理
+      </h1>
+      <p class="page-subtitle">查看和管理您的所有交易订单</p>
+    </div>
     <el-table :data="orders || []" style="width: 100%" v-loading="!orders">
       <el-table-column prop="symbol" label="交易对"></el-table-column>
       <el-table-column prop="side" label="方向">
@@ -67,9 +73,13 @@
 <script>
 import { computed, onMounted } from 'vue'
 import { useStore } from 'vuex'
+import { List } from '@element-plus/icons-vue'
 
 export default {
   name: 'Orders',
+  components: {
+    List
+  },
   setup() {
     const store = useStore()
     
@@ -126,7 +136,27 @@ export default {
 
 <style scoped>
 .orders {
-  padding: 20px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.orders-header {
+  margin-bottom: 24px;
+}
+
+.page-title {
+  display: flex;
+  align-items: center;
+  font-size: 28px;
+  font-weight: 600;
+  color: #303133;
+  margin: 0 0 8px 0;
+}
+
+.page-subtitle {
+  color: #909399;
+  font-size: 14px;
+  margin: 0;
 }
 
 .profit {
@@ -137,6 +167,11 @@ export default {
 .loss {
   color: #f56c6c;
   font-weight: bold;
+}
+
+:deep(.el-table) {
+  border-radius: 8px;
+  overflow: hidden;
 }
 </style>
 

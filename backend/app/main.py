@@ -3,12 +3,15 @@ FastAPI应用主入口
 """
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
 from app.core.database import engine, Base
 from app.core.config import settings
 from app.api import auth, strategies, trades, websocket
 import logging
+import time
 
 # 配置日志
 logging.basicConfig(
@@ -27,6 +30,9 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# 添加GZip压缩中间件（在CORS之前）
+app.add_middleware(GZipMiddleware, minimum_size=1000)  # 只压缩大于1KB的响应
+
 # 配置CORS
 app.add_middleware(
     CORSMiddleware,
@@ -35,6 +41,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# 响应缓存中间件（为GET请求添加缓存头）
+class CacheControlMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        
+        # 为GET请求添加缓存头（根据路径决定缓存时间）
+        if request.method == "GET":
+            path = request.url.path
+            
+            # 静态数据可以缓存更久
+            if "/api/strategies/" in path and "/user" not in path:
+                response.headers["Cache-Control"] = "public, max-age=300"  # 5分钟
+            # 用户数据缓存时间较短
+            elif "/api/trades/positions" in path or "/api/trades/orders" in path:
+                response.headers["Cache-Control"] = "public, max-age=10"  # 10秒
+            # 其他API响应不缓存
+            else:
+                response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                response.headers["Pragma"] = "no-cache"
+                response.headers["Expires"] = "0"
+        
+        return response
+
+app.add_middleware(CacheControlMiddleware)
 
 # 添加请求验证异常处理
 @app.exception_handler(RequestValidationError)

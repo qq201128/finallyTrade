@@ -1,6 +1,12 @@
 <template>
   <div class="positions">
-    <h1>持仓管理</h1>
+    <div class="positions-header">
+      <h1 class="page-title">
+        <el-icon :size="28" style="margin-right: 12px"><Wallet /></el-icon>
+        持仓管理
+      </h1>
+      <p class="page-subtitle">实时监控和管理您的交易持仓</p>
+    </div>
     
     <!-- 持仓统计 -->
     <el-row :gutter="20" style="margin-bottom: 20px">
@@ -261,9 +267,14 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useStore } from 'vuex'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/services/api'
+import { Wallet } from '@element-plus/icons-vue'
+import { debounce } from '@/utils/request-optimizer'
 
 export default {
   name: 'Positions',
+  components: {
+    Wallet
+  },
   setup() {
     const store = useStore()
     const closingPositionId = ref(null)
@@ -479,8 +490,8 @@ export default {
       }
     }
     
-    // 手动刷新持仓（完整模式，获取最新价格）
-    const handleRefreshPositions = async () => {
+    // 手动刷新持仓（完整模式，获取最新价格）- 添加防抖
+    const handleRefreshPositions = debounce(async () => {
       try {
         positionsLoading.value = true
         // 使用完整模式（fast=false）获取最新价格
@@ -492,7 +503,7 @@ export default {
       } finally {
         positionsLoading.value = false
       }
-    }
+    }, 1000)  // 1秒防抖
     
     // 监听标签页切换，切换到历史时加载数据
     watch(activeTab, (newTab) => {
@@ -571,6 +582,30 @@ export default {
 </script>
 
 <style scoped>
+.positions {
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.positions-header {
+  margin-bottom: 24px;
+}
+
+.page-title {
+  display: flex;
+  align-items: center;
+  font-size: 28px;
+  font-weight: 600;
+  color: #303133;
+  margin: 0 0 8px 0;
+}
+
+.page-subtitle {
+  color: #909399;
+  font-size: 14px;
+  margin: 0;
+}
+
 .profit {
   color: #67c23a;
   font-weight: bold;
@@ -587,13 +622,34 @@ export default {
 
 .stat-label {
   font-size: 14px;
-  color: #666;
+  color: #909399;
   margin-bottom: 10px;
+  font-weight: 500;
 }
 
 .stat-value {
   font-size: 24px;
-  font-weight: bold;
+  font-weight: 700;
+  color: #303133;
+}
+
+:deep(.el-tabs__header) {
+  margin-bottom: 20px;
+}
+
+:deep(.el-tabs__item) {
+  font-weight: 500;
+  font-size: 15px;
+}
+
+:deep(.el-table) {
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.reentry-card {
+  margin-bottom: 20px;
+  border-left: 4px solid #e6a23c;
 }
 </style>
 

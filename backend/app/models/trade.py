@@ -33,9 +33,9 @@ class Position(Base):
     __tablename__ = "positions"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    user_strategy_id = Column(Integer, ForeignKey("user_strategies.id"), nullable=False)
-    symbol = Column(String, nullable=False)  # 交易对，如 BTC/USDT
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)  # 添加索引
+    user_strategy_id = Column(Integer, ForeignKey("user_strategies.id"), nullable=False, index=True)  # 添加索引
+    symbol = Column(String, nullable=False, index=True)  # 交易对，如 BTC/USDT，添加索引
     side = Column(String, nullable=False)  # long/short
     size = Column(Float, nullable=False)  # 持仓数量
     entry_price = Column(Float, nullable=False)  # 开仓价格
@@ -44,9 +44,9 @@ class Position(Base):
     leverage = Column(Integer, default=1)  # 杠杆倍数（如 10x, 20x）
     stop_loss = Column(Float)  # 止损价格
     take_profit = Column(Float)  # 止盈价格
-    is_open = Column(Boolean, default=True)  # 是否持仓中
-    opened_at = Column(DateTime(timezone=True), server_default=func.now())
-    closed_at = Column(DateTime(timezone=True))
+    is_open = Column(Boolean, default=True, index=True)  # 是否持仓中，添加索引
+    opened_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)  # 添加索引
+    closed_at = Column(DateTime(timezone=True), index=True)  # 添加索引
     
     # 关系
     user = relationship("User", back_populates="positions")
@@ -58,19 +58,19 @@ class Order(Base):
     __tablename__ = "orders"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    position_id = Column(Integer, ForeignKey("positions.id"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)  # 添加索引
+    position_id = Column(Integer, ForeignKey("positions.id"), nullable=True, index=True)  # 添加索引
     exchange_order_id = Column(String, unique=True, index=True)  # 交易所订单ID
-    symbol = Column(String, nullable=False)
+    symbol = Column(String, nullable=False, index=True)  # 添加索引
     side = Column(SQLEnum(OrderSide), nullable=False)
     type = Column(SQLEnum(OrderType), nullable=False)
     amount = Column(Float, nullable=False)
     price = Column(Float)  # 限价单价格
-    status = Column(SQLEnum(OrderStatus), default=OrderStatus.PENDING)
+    status = Column(SQLEnum(OrderStatus), default=OrderStatus.PENDING, index=True)  # 添加索引
     filled = Column(Float, default=0.0)  # 已成交数量
     cost = Column(Float)  # 成交金额
     fee = Column(Float, default=0.0)  # 手续费
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)  # 添加索引
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     filled_at = Column(DateTime(timezone=True))
     
@@ -83,17 +83,17 @@ class PnLRecord(Base):
     __tablename__ = "pnl_records"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    user_strategy_id = Column(Integer, ForeignKey("user_strategies.id"), nullable=False)
-    position_id = Column(Integer, ForeignKey("positions.id"), nullable=False)
-    symbol = Column(String, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)  # 添加索引
+    user_strategy_id = Column(Integer, ForeignKey("user_strategies.id"), nullable=False, index=True)  # 添加索引
+    position_id = Column(Integer, ForeignKey("positions.id"), nullable=False, index=True)  # 添加索引
+    symbol = Column(String, nullable=False, index=True)  # 添加索引
     entry_price = Column(Float, nullable=False)
     exit_price = Column(Float, nullable=False)
     size = Column(Float, nullable=False)
     realized_pnl = Column(Float, nullable=False)  # 已实现盈亏
     fee = Column(Float, default=0.0)
     pnl_percentage = Column(Float)  # 盈亏百分比
-    closed_at = Column(DateTime(timezone=True), server_default=func.now())
+    closed_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)  # 添加索引
     
     # 关系
     user = relationship("User")

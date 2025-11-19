@@ -83,6 +83,17 @@ class ConnectionManager:
         self.subscription_refs: Dict[str, int] = {}
         # ExchangeService 实例缓存 {cache_key: ExchangeService}
         self.global_exchange_services: Dict[str, Any] = {}
+        # 批量更新队列：{symbol: (current_price, timestamp)} - 用于批量更新数据库
+        self._price_update_queue: Dict[str, tuple] = {}
+        # 批量更新任务
+        self._batch_update_task: Optional[asyncio.Task] = None
+        # 持仓缓存：{symbol: [position_info]} - 缓存持仓信息，减少数据库查询
+        self._positions_cache: Dict[str, List[Dict]] = {}
+        # 持仓缓存更新时间戳
+        self._positions_cache_timestamp: float = 0
+        # 持仓缓存有效期（秒）
+        self._positions_cache_ttl: float = 10.0
+        # 批量更新任务将在有事件循环时启动（延迟初始化）
     
     async def connect(self, websocket: WebSocket, user_id: int = None):
         """接受WebSocket连接"""
@@ -114,8 +125,8 @@ class ConnectionManager:
             except Exception as e:
                 logger.error(f"广播消息失败: {e}")
     
-    def get_or_create_ticker_subscription(self, symbol: str, exchange_service: Any, strategy_info: Dict[str, Any], db: Session):
-        """获取或创建价格订阅（全局共享）"""
+    def get_or_create_ticker_subscription(self, symbol: str, exchange_service: Any, strategy_info: Dict[str, Any], db: Session = None):
+        """获取或创建价格订阅（全局共享，不依赖传入的db Session）"""
         if symbol in self.global_ticker_tasks:
             # 检查任务是否还在运行
             task = self.global_ticker_tasks[symbol]
@@ -125,10 +136,10 @@ class ConnectionManager:
                 logger.debug(f"复用现有的 {symbol} 价格订阅（引用计数: {self.subscription_refs[symbol]}）")
                 return True
         
-        # 创建新的订阅
+        # 创建新的订阅（不传入db，让内部方法自己管理Session）
         import asyncio
         task = asyncio.create_task(
-            self._watch_price_global(symbol, exchange_service, strategy_info, db)
+            self._watch_price_global(symbol, exchange_service, strategy_info)
         )
         self.global_ticker_tasks[symbol] = task
         self.subscription_refs[symbol] = 1
@@ -155,8 +166,8 @@ class ConnectionManager:
                 if symbol in self.subscription_refs:
                     del self.subscription_refs[symbol]
     
-    async def _watch_price_global(self, symbol: str, exchange_service: Any, strategy_info: Dict[str, Any], db: Session):
-        """全局价格订阅任务（所有连接共享）"""
+    async def _watch_price_global(self, symbol: str, exchange_service: Any, strategy_info: Dict[str, Any]):
+        """全局价格订阅任务（所有连接共享，内部管理数据库会话）"""
         use_polling = False
         
         # 先尝试使用 WebSocket（如果启用）
@@ -182,8 +193,8 @@ class ConnectionManager:
                             'timestamp': ticker.get('timestamp', 0)
                         }
                         
-                        # 广播给所有连接的客户端
-                        await self._broadcast_price_update(symbol, current_price, db)
+                        # 广播给所有连接的客户端（不传入db，让方法自己管理）
+                        await self._broadcast_price_update(symbol, current_price)
             except asyncio.CancelledError:
                 logger.info(f"{symbol} 价格订阅任务被取消")
                 raise
@@ -219,83 +230,226 @@ class ConnectionManager:
                             'timestamp': ticker.get('timestamp', 0)
                         }
                         
-                        await self._broadcast_price_update(symbol, current_price, db)
+                        await self._broadcast_price_update(symbol, current_price)
                     
                     await asyncio.sleep(2)  # 每2秒轮询一次
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger.error(f"轮询 {symbol} 价格失败: {e}")
+                    logger.error(f"轮询 {symbol} 价格失败: {e}", exc_info=True)
                     await asyncio.sleep(5)  # 出错时等待更长时间
     
-    async def _broadcast_price_update(self, symbol: str, current_price: float, db: Session):
-        """广播价格更新给所有连接的客户端"""
+    def _ensure_batch_update_task(self):
+        """确保批量更新任务已启动（延迟初始化）"""
+        import asyncio
+        if self._batch_update_task is None or self._batch_update_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+                self._batch_update_task = loop.create_task(self._batch_update_worker())
+                logger.debug("批量更新任务已启动")
+            except RuntimeError:
+                # 如果没有运行的事件循环，将在下次有事件循环时启动
+                logger.debug("当前无事件循环，批量更新任务将在下次启动")
+    
+    async def _broadcast_price_update(self, symbol: str, current_price: float, db: Session = None):
+        """广播价格更新给所有连接的客户端（优化：实时推送，批量更新数据库）"""
         if current_price <= 0:
             return
         
-        # 为所有有该交易对持仓的用户更新并推送
+        import time
+        # 确保批量更新任务已启动
+        self._ensure_batch_update_task()
+        
+        # 将价格更新加入批量更新队列（用于数据库更新）
+        self._price_update_queue[symbol] = (current_price, time.time())
+        
+        # 实时推送价格更新给客户端（不等待数据库更新）
+        await self._push_price_to_clients(symbol, current_price)
+    
+    async def _get_positions_for_symbol(self, symbol: str):
+        """获取交易对的持仓信息（使用缓存，减少数据库查询）"""
+        import time
         from app.models.trade import Position
-        from app.models.strategy import UserStrategy
+        from app.core.database import get_db_context
         
-        # 获取所有有该交易对持仓的用户
-        positions = db.query(Position).filter(
-            Position.symbol == symbol,
-            Position.is_open == True
-        ).all()
+        current_time = time.time()
         
-        if not positions:
-            return
+        # 检查缓存是否有效
+        if (symbol in self._positions_cache and 
+            current_time - self._positions_cache_timestamp < self._positions_cache_ttl):
+            return self._positions_cache[symbol]
         
-        # 按用户分组
-        user_positions = {}
-        for position in positions:
-            if position.user_id not in user_positions:
-                user_positions[position.user_id] = []
-            user_positions[position.user_id].append(position)
-        
-        # 为每个用户更新并推送
-        for user_id, user_pos_list in user_positions.items():
-            position_data = []
-            for position in user_pos_list:
-                old_price = position.current_price
-                position.current_price = current_price
-                if position.entry_price:
-                    position.unrealized_pnl = _calculate_unrealized_pnl(position, current_price)
+        # 缓存失效，重新查询（使用单个Session批量查询所有持仓）
+        try:
+            with get_db_context() as read_db:
+                positions = read_db.query(Position).filter(
+                    Position.symbol == symbol,
+                    Position.is_open == True
+                ).all()
                 
-                margin_used = _calculate_margin_used(position)
-                pnl_percentage = _calculate_pnl_percentage(position)
+                # 转换为字典格式并缓存
+                position_list = []
+                for pos in positions:
+                    position_list.append({
+                        'id': pos.id,
+                        'user_id': pos.user_id,
+                        'symbol': pos.symbol,
+                        'side': pos.side,
+                        'size': pos.size,
+                        'entry_price': pos.entry_price,
+                        'leverage': pos.leverage or 1
+                    })
                 
-                position_data.append({
-                    "id": position.id,
-                    "symbol": position.symbol,
-                    "side": position.side,
-                    "size": position.size,
-                    "entry_price": position.entry_price,
-                    "current_price": current_price,
-                    "unrealized_pnl": position.unrealized_pnl,
-                    "leverage": position.leverage or 1,
-                    "margin_used": margin_used,
-                    "pnl_percentage": pnl_percentage
-                })
+                # 更新缓存
+                self._positions_cache[symbol] = position_list
+                self._positions_cache_timestamp = current_time
+                
+                return position_list
+        except Exception as e:
+            logger.error(f"查询持仓失败 {symbol}: {e}")
+            return []
+    
+    async def _push_price_to_clients(self, symbol: str, current_price: float):
+        """推送价格更新给客户端（使用缓存，不涉及数据库操作）"""
+        try:
+            # 从缓存获取持仓信息（避免频繁查询数据库）
+            positions = await self._get_positions_for_symbol(symbol)
             
-            # 提交数据库更改
-            db.commit()
+            if not positions:
+                return
             
-            # 发送给所有该用户的连接
-            message = {
-                "type": "positions",
-                "data": position_data
-            }
+            # 按用户分组
+            user_positions = {}
+            for pos_info in positions:
+                user_id = pos_info['user_id']
+                if user_id not in user_positions:
+                    user_positions[user_id] = []
+                user_positions[user_id].append(pos_info)
             
-            # 只发送给该用户的连接
-            for connection in self.active_connections:
+            # 为每个用户推送更新（使用最新价格计算，但不更新数据库）
+            for user_id, user_pos_list in user_positions.items():
+                position_data = []
+                for pos_info in user_pos_list:
+                    try:
+                        # 创建临时Position对象用于计算
+                        class TempPosition:
+                            def __init__(self, info):
+                                self.entry_price = info['entry_price']
+                                self.size = info['size']
+                                self.leverage = info['leverage']
+                                self.side = info['side']
+                        
+                        temp_pos = TempPosition(pos_info)
+                        
+                        # 使用最新价格计算盈亏
+                        calculated_pnl = _calculate_unrealized_pnl(temp_pos, current_price)
+                        temp_pos.unrealized_pnl = calculated_pnl
+                        
+                        margin_used = _calculate_margin_used(temp_pos)
+                        pnl_percentage = _calculate_pnl_percentage(temp_pos)
+                        
+                        position_data.append({
+                            "id": pos_info['id'],
+                            "symbol": pos_info['symbol'],
+                            "side": pos_info['side'],
+                            "size": pos_info['size'],
+                            "entry_price": pos_info['entry_price'],
+                            "current_price": current_price,
+                            "unrealized_pnl": calculated_pnl,
+                            "leverage": pos_info['leverage'],
+                            "margin_used": margin_used,
+                            "pnl_percentage": pnl_percentage
+                        })
+                    except Exception as e:
+                        logger.error(f"计算持仓 {pos_info['id']} 盈亏失败: {e}")
+                        continue
+                
+                # 发送给所有该用户的连接
+                message = {
+                    "type": "positions",
+                    "data": position_data
+                }
+                
+                # 只发送给该用户的连接
+                for connection in self.active_connections:
+                    try:
+                        connection_user_id = self.connection_users.get(connection)
+                        if connection_user_id == user_id:
+                            await connection.send_json(message)
+                    except Exception as e:
+                        logger.debug(f"发送价格更新失败: {e}")
+        except Exception as e:
+            logger.error(f"推送价格更新失败 {symbol}: {e}", exc_info=True)
+    
+    async def _batch_update_worker(self):
+        """批量更新数据库的工作线程（降低数据库更新频率，避免连接池溢出）"""
+        import asyncio
+        from app.models.trade import Position
+        from app.core.database import get_db_context
+        
+        # 每5秒批量更新一次数据库（而不是每次价格变化都更新）
+        BATCH_UPDATE_INTERVAL = 5.0  # 5秒
+        MAX_BATCH_SIZE = 50  # 每次最多更新50个持仓
+        
+        while True:
+            try:
+                await asyncio.sleep(BATCH_UPDATE_INTERVAL)
+                
+                # 获取待更新的价格
+                if not self._price_update_queue:
+                    continue
+                
+                # 复制队列并清空（避免并发修改）
+                updates_to_process = dict(self._price_update_queue)
+                self._price_update_queue.clear()
+                
+                if not updates_to_process:
+                    continue
+                
+                # 批量更新数据库（使用单个Session）
                 try:
-                    # 检查连接对应的用户ID是否匹配
-                    connection_user_id = self.connection_users.get(connection)
-                    if connection_user_id == user_id:
-                        await connection.send_json(message)
+                    with get_db_context() as update_db:
+                        # 获取所有需要更新的持仓
+                        symbols = list(updates_to_process.keys())
+                        positions = update_db.query(Position).filter(
+                            Position.symbol.in_(symbols),
+                            Position.is_open == True
+                        ).limit(MAX_BATCH_SIZE).all()
+                        
+                        if not positions:
+                            continue
+                        
+                        # 批量更新
+                        updated_count = 0
+                        for position in positions:
+                            if position.symbol in updates_to_process:
+                                current_price, _ = updates_to_process[position.symbol]
+                                try:
+                                    position.current_price = current_price
+                                    if position.entry_price:
+                                        position.unrealized_pnl = _calculate_unrealized_pnl(position, current_price)
+                                    updated_count += 1
+                                except Exception as e:
+                                    logger.error(f"批量更新持仓 {position.id} 失败: {e}")
+                        
+                        if updated_count > 0:
+                            # 一次性提交所有更新
+                            update_db.commit()
+                            logger.debug(f"批量更新了 {updated_count} 个持仓的价格")
+                            
+                            # 清除相关缓存，强制下次重新查询
+                            for symbol in updates_to_process.keys():
+                                if symbol in self._positions_cache:
+                                    del self._positions_cache[symbol]
                 except Exception as e:
-                    logger.debug(f"发送价格更新失败: {e}")
+                    logger.error(f"批量更新数据库失败: {e}", exc_info=True)
+                    
+            except asyncio.CancelledError:
+                logger.info("批量更新任务被取消")
+                break
+            except Exception as e:
+                logger.error(f"批量更新工作线程错误: {e}", exc_info=True)
+                await asyncio.sleep(5)  # 出错时等待更长时间
 
 
 manager = ConnectionManager()
@@ -348,8 +502,8 @@ async def websocket_positions(websocket: WebSocket, user_id: int):
             
             exchange_service = manager.global_exchange_services[cache_key]
             
-            # 获取或创建全局价格订阅（如果已存在则复用）
-            if manager.get_or_create_ticker_subscription(position.symbol, exchange_service, strategy_info, db):
+            # 获取或创建全局价格订阅（如果已存在则复用，不传入db）
+            if manager.get_or_create_ticker_subscription(position.symbol, exchange_service, strategy_info):
                 subscribed_symbols.add(position.symbol)
         
         # 发送初始持仓数据（使用数据库中的价格或全局缓存）

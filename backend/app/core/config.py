@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     # 数据库配置
     DATABASE_URL: str = "sqlite:///./trading_system.db"
     
+    # 数据库连接池配置（可选，用于非SQLite数据库）
+    DB_POOL_SIZE: int = 50  # 连接池大小
+    DB_MAX_OVERFLOW: int = 50  # 最大溢出连接数
+    
     # 策略文件目录
     STRATEGIES_DIR: str = "./app/strategies"
     

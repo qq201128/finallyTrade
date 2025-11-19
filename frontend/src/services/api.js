@@ -1,5 +1,6 @@
 import axios from 'axios'
 import store from '@/store'
+import { dedupeRequest, generateRequestKey } from '@/utils/request-optimizer'
 
 const api = axios.create({
   baseURL: '/api',
@@ -31,6 +32,17 @@ api.interceptors.response.use(
     return Promise.reject(error)
   }
 )
+
+// 包装API方法，添加请求去重功能（仅对GET请求）
+const originalGet = api.get
+api.get = function(url, config = {}) {
+  // 只对GET请求进行去重
+  const requestKey = generateRequestKey('GET', url, config.params)
+  
+  return dedupeRequest(requestKey, () => {
+    return originalGet.call(this, url, config)
+  })
+}
 
 export default api
 
