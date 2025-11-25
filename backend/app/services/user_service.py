@@ -10,18 +10,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 # 配置密码上下文，使用 bcrypt 算法
-# 注意：bcrypt 版本警告不影响功能，可以忽略
-# 如果需要消除警告，可以升级 bcrypt 到最新版本
 pwd_context = CryptContext(
     schemes=["bcrypt"],
     deprecated="auto",
     bcrypt__rounds=12,  # bcrypt 轮数
     bcrypt__ident="2b"  # 使用 2b 标识符（更兼容）
 )
-
-# 抑制 bcrypt 版本警告（可选）
-import warnings
-warnings.filterwarnings("ignore", message=".*bcrypt.*", category=UserWarning)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:

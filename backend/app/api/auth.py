@@ -149,7 +149,7 @@ async def login(
             logger.warning(f"登录失败: 用户名或密码错误 (用户名={form_data.username})")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect username or password",
+                detail="用户名或密码错误",
                 headers={"WWW-Authenticate": "Bearer"},
             )
         access_token = create_access_token(data={"sub": user.username})
@@ -161,7 +161,7 @@ async def login(
         logger.error(f"登录异常: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Login failed: {str(e)}"
+            detail=f"登录失败: {str(e)}"
         )
 
 

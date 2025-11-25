@@ -191,7 +191,12 @@ export default {
   setup() {
     const store = useStore()
     
-    const positions = computed(() => store.state.trades.positions)
+    // 只显示未平仓的持仓
+    const positions = computed(() => {
+      const allPositions = store.state.trades.positions || []
+      // 过滤掉已平仓的持仓
+      return allPositions.filter(p => p.is_open !== false && p.is_open !== 0)
+    })
     const orders = computed(() => store.state.trades.orders)
     const pnlRecords = computed(() => store.state.trades.pnlRecords)
     const userStrategies = computed(() => store.state.strategies.userStrategies)

@@ -109,7 +109,7 @@ async def get_exchange_symbols(exchange: str):
     """获取指定交易所支持的永续合约交易对列表"""
     try:
         exchange_service = ExchangeService(exchange_name=exchange)
-        symbols = exchange_service.get_tradable_symbols()
+        symbols = await exchange_service.get_tradable_symbols_async()
         return sorted(symbols)
     except Exception as e:
         logger.error(f"获取交易所 {exchange} 交易对失败: {e}", exc_info=True)

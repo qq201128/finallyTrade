@@ -18,6 +18,8 @@ from app.models import Position, Order, UserStrategy, PnLRecord
 from app.models.trade import OrderStatus, OrderSide, OrderType
 from app.services.exchange_service import ExchangeService
 from app.services.strategy_engine import StrategyEngine
+from app.services.ohlcv_cache import get_ohlcv_cache
+from app.core.config import settings
 import pandas as pd
 import re
 
@@ -43,7 +45,8 @@ class BidirectionalTradingEngine:
         self.exchange_service = exchange_service
         self.strategy_engine = strategy_engine
         self.strategy_module = None
-        self.ohlcv_cache: Dict[str, Dict[str, Any]] = {}
+        # 使用全局共享的OHLCV缓存
+        self.ohlcv_cache = get_ohlcv_cache(ttl_seconds=settings.CACHE_OHLCV_TTL)
         
         # 加载策略
         self._load_strategy()
@@ -151,18 +154,23 @@ class BidirectionalTradingEngine:
     
     def fetch_ohlcv_data(self, symbol: str, timeframe: str = None, 
                         limit: int = 100) -> Optional[pd.DataFrame]:
-        """获取OHLCV数据（带缓存）"""
+        """
+        获取OHLCV数据（使用全局共享缓存）
+        多个策略可以共享相同交易对的K线数据
+        """
         if timeframe is None:
             timeframe = self.user_strategy.timeframe if self.user_strategy.timeframe else '1h'
         
-        cache_key = f"{symbol}_{timeframe}"
+        # 从全局共享缓存获取
+        exchange_name = self.exchange_service.exchange_name
+        cached_df = self.ohlcv_cache.get(exchange_name, symbol, timeframe)
+        if cached_df is not None:
+            logger.debug(f"从共享缓存获取OHLCV数据: {exchange_name}:{symbol}:{timeframe}")
+            return cached_df
         
-        if cache_key in self.ohlcv_cache:
-            cached_data = self.ohlcv_cache[cache_key]
-            if (datetime.now() - cached_data['timestamp']).seconds < 300:
-                return cached_data['dataframe']
-        
+        # 缓存未命中，从交易所获取
         try:
+            logger.debug(f"从交易所获取OHLCV数据: {exchange_name}:{symbol}:{timeframe}")
             ohlcv = self.exchange_service.fetch_ohlcv(symbol, timeframe, limit=limit)
             if not ohlcv:
                 return None
@@ -171,10 +179,8 @@ class BidirectionalTradingEngine:
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
             
-            self.ohlcv_cache[cache_key] = {
-                'dataframe': df,
-                'timestamp': datetime.now()
-            }
+            # 存储到全局共享缓存
+            self.ohlcv_cache.set(exchange_name, symbol, timeframe, df)
             
             return df
         except Exception as e:
@@ -435,7 +441,7 @@ class BidirectionalTradingEngine:
                         logger.info(f"触发出场信号: {symbol}, 方向: {position.side}")
                 
                 # 检查自定义退出
-                custom_exit = self.call_strategy_callback('custom_exit', position, current_price)
+                custom_exit = self.call_strategy_callback('custom_exit', position, current_price, self.db, self.user_strategy)
                 if custom_exit:
                     should_close = True
                     exit_price = custom_exit.get('price', current_price)
@@ -611,7 +617,7 @@ class BidirectionalTradingEngine:
         if not self.user_strategy.config.get('position_adjustment', False):
             return
         
-        adjustment = self.call_strategy_callback('adjust_position', position)
+        adjustment = self.call_strategy_callback('adjust_position', position, self.db, self.user_strategy)
         if adjustment and adjustment.get('should_adjust', False):
             try:
                 amount = adjustment.get('amount', 0)

@@ -239,6 +239,17 @@ DATABASE_URL=sqlite:///./trading_system.db
 DATABASE_URL=postgresql://user:password@localhost/dbname
 ```
 
+### OHLCV缓存配置
+系统使用全局共享的OHLCV缓存，多个策略可以共享相同交易对的K线数据，减少内存占用和API调用：
+```
+CACHE_OHLCV_TTL=300  # OHLCV数据缓存有效期（秒），默认5分钟
+```
+
+**优化效果**：
+- 减少内存占用：200个策略共享缓存，而不是每个策略独立缓存
+- 减少API调用：相同交易对的数据只需获取一次
+- 提高性能：缓存命中时直接返回，无需网络请求
+
 ## API文档
 
 启动后端服务后，访问：

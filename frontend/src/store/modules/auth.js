@@ -51,7 +51,14 @@ const actions = {
         data: error.response?.data,
         message: error.message
       })
-      const errorMessage = error.response?.data?.detail || error.message || '登录失败'
+      // 错误信息映射为中文
+      let errorMessage = error.response?.data?.detail || error.message || '登录失败'
+      // 如果后端返回的是英文，映射为中文
+      if (errorMessage === 'Incorrect username or password') {
+        errorMessage = '用户名或密码错误'
+      } else if (errorMessage.includes('Login failed')) {
+        errorMessage = errorMessage.replace('Login failed', '登录失败')
+      }
       return { success: false, error: errorMessage }
     }
   },

@@ -15,7 +15,13 @@ import numpy as np
 import pandas as pd
 from app.strategies.base_strategy import BaseStrategy
 
-strategy_state = {
+def _get_strategy_state(user_strategy):
+    """从数据库配置中获取策略状态，如果不存在则初始化"""
+    if not user_strategy.config:
+        user_strategy.config = {}
+    
+    if 'replenish_state' not in user_strategy.config:
+        user_strategy.config['replenish_state'] = {
     'long': {
         'wins': 0,
         'last_trend': None,
@@ -28,40 +34,60 @@ strategy_state = {
     }
 }
 
-
-def _reset_state():
-    for side in strategy_state.keys():
-        strategy_state[side]['wins'] = 0
-        strategy_state[side]['last_trend'] = None
-        strategy_state[side]['replenish_pool'].clear()
+    return user_strategy.config['replenish_state']
 
 
-def _record_win(side: str, position_size: float):
+def _save_strategy_state(user_strategy, db):
+    """保存策略状态到数据库"""
+    try:
+        db.commit()
+    except Exception as e:
+        print(f"[错误] 保存策略状态失败: {e}")
+        db.rollback()
+
+
+def _reset_state(user_strategy, db):
+    """重置策略状态"""
+    state = _get_strategy_state(user_strategy)
+    for side in state.keys():
+        state[side]['wins'] = 0
+        state[side]['last_trend'] = None
+        state[side]['replenish_pool'] = []
+    _save_strategy_state(user_strategy, db)
+
+
+def _record_win(side: str, position_size: float, user_strategy, db):
     """记录方向盈利，用于生成补仓机会"""
-    state = strategy_state[side]
-    state['wins'] += 1
-    if state['wins'] % 4 == 0 and position_size:
+    state = _get_strategy_state(user_strategy)
+    state[side]['wins'] = state[side].get('wins', 0) + 1
+    if state[side]['wins'] % 4 == 0 and position_size:
         opposite = 'short' if side == 'long' else 'long'
         replenish_amount = max(position_size * 0.5, 0)
         if replenish_amount > 0:
-            strategy_state[opposite]['replenish_pool'].append(replenish_amount)
+            if 'replenish_pool' not in state[opposite]:
+                state[opposite]['replenish_pool'] = []
+            state[opposite]['replenish_pool'].append(replenish_amount)
+            _save_strategy_state(user_strategy, db)
 
 
-def _update_trend_state(side: str, roi: float):
+def _update_trend_state(side: str, roi: float, user_strategy, db):
     """监控趋势反转：盈利 -> 亏损 或 亏损 -> 盈利"""
     if roi is None:
         return
+    state = _get_strategy_state(user_strategy)
     if roi > 0:
         trend = 'profit'
     elif roi < 0:
         trend = 'loss'
     else:
         trend = 'flat'
-    last = strategy_state[side]['last_trend']
+    last = state[side].get('last_trend')
     if last and trend in ('profit', 'loss') and trend != last:
-        _reset_state()
+        _reset_state(user_strategy, db)
+        state = _get_strategy_state(user_strategy)  # 重新获取重置后的状态
     if trend in ('profit', 'loss'):
-        strategy_state[side]['last_trend'] = trend
+        state[side]['last_trend'] = trend
+        _save_strategy_state(user_strategy, db)
 
 def populate_indicators(dataframe, metadata):
     """
@@ -147,7 +173,7 @@ class BidirectionalExampleStrategy(BaseStrategy):
     #     print(f"[双向交易策略] 订单 {order.id} 已成交: {exchange_order.get('symbol')}, "
     #           f"方向: {order.side}, 数量: {exchange_order.get('filled')}, 价格: {exchange_order.get('price')}")
     
-    def custom_exit(self, position, current_price):
+    def custom_exit(self, position, current_price, db=None, user_strategy=None):
         """
         自定义退出逻辑（支持双向）
         
@@ -158,6 +184,8 @@ class BidirectionalExampleStrategy(BaseStrategy):
         Args:
             position: 持仓对象
             current_price: 当前价格
+            db: 数据库会话（可选，用于持久化状态）
+            user_strategy: 用户策略对象（可选，用于持久化状态）
         
         Returns:
             dict或None: 如果返回dict，包含退出信息
@@ -165,13 +193,22 @@ class BidirectionalExampleStrategy(BaseStrategy):
         if not position or not position.entry_price or position.entry_price <= 0 or not current_price:
             return None
         
+        # 获取 user_strategy 和 db（如果未传递）
+        if not user_strategy and hasattr(position, 'user_strategy'):
+            user_strategy = position.user_strategy
+        if not db and user_strategy and hasattr(user_strategy, '_sa_instance_state'):
+            # 尝试从 user_strategy 获取数据库会话
+            from sqlalchemy.orm import object_session
+            db = object_session(user_strategy) if user_strategy else None
+        
         # 计算盈亏比例（根据持仓方向）
         if position.side == 'long':
             roi = (current_price - position.entry_price) / position.entry_price
         else:
             roi = (position.entry_price - current_price) / position.entry_price
         
-        _update_trend_state(position.side, roi)
+        if user_strategy and db:
+            _update_trend_state(position.side, roi, user_strategy, db)
         
         # 计算杠杆后的盈亏百分比（基于保证金）
         leverage = getattr(position, 'leverage', 1) or 1
@@ -202,7 +239,8 @@ class BidirectionalExampleStrategy(BaseStrategy):
         
         # 止盈：盈利超过保证金50%时平仓（考虑杠杆）
         if pnl_percentage >= 50:
-            _record_win(position.side, position.size)
+            if user_strategy and db:
+                _record_win(position.side, position.size, user_strategy, db)
             return {
                 'price': current_price,
                 'reason': 'take_profit_50pct',
@@ -211,7 +249,7 @@ class BidirectionalExampleStrategy(BaseStrategy):
         
         return None
     
-    def adjust_position(self, position):
+    def adjust_position(self, position, db=None, user_strategy=None):
         """
         仓位调整逻辑（支持双向补仓）
         
@@ -222,6 +260,8 @@ class BidirectionalExampleStrategy(BaseStrategy):
         
         Args:
             position: 持仓对象
+            db: 数据库会话（可选，用于持久化状态）
+            user_strategy: 用户策略对象（可选，用于持久化状态）
         
         Returns:
             dict: 包含{'should_adjust': bool, 'amount': float}
@@ -233,23 +273,35 @@ class BidirectionalExampleStrategy(BaseStrategy):
         if current_price is None or current_price <= 0:
             return {'should_adjust': False, 'amount': 0}
         
+        # 获取 user_strategy 和 db（如果未传递）
+        if not user_strategy and hasattr(position, 'user_strategy'):
+            user_strategy = position.user_strategy
+        if not db and user_strategy and hasattr(user_strategy, '_sa_instance_state'):
+            # 尝试从 user_strategy 获取数据库会话
+            from sqlalchemy.orm import object_session
+            db = object_session(user_strategy) if user_strategy else None
+        
         if position.side == 'long':
             roi = (current_price - position.entry_price) / position.entry_price
         else:
             roi = (position.entry_price - current_price) / position.entry_price
         
-        _update_trend_state(position.side, roi)
+        if user_strategy and db:
+            _update_trend_state(position.side, roi, user_strategy, db)
         
         # 仅在亏损且存在补仓额度时执行
-        replenish_pool = strategy_state[position.side]['replenish_pool']
-        if roi < 0 and replenish_pool:
-            amount = replenish_pool.pop(0)
-            amount = max(amount, 0)
-            if amount > 0:
-                return {
-                    'should_adjust': True,
-                    'amount': amount
-                }
+        if user_strategy:
+            state = _get_strategy_state(user_strategy)
+            replenish_pool = state[position.side].get('replenish_pool', [])
+            if roi < 0 and replenish_pool:
+                amount = replenish_pool.pop(0)
+                amount = max(amount, 0)
+                if amount > 0:
+                    _save_strategy_state(user_strategy, db)
+                    return {
+                        'should_adjust': True,
+                        'amount': amount
+                    }
         
         return {'should_adjust': False, 'amount': 0}
 

@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.models.trade import Position, Order
 from app.models.user import User
 from app.api.auth import get_current_user
+from app.services.monitoring import monitoring
 
 logger = logging.getLogger(__name__)
 
@@ -168,10 +169,10 @@ class ConnectionManager:
     
     async def _watch_price_global(self, symbol: str, exchange_service: Any, strategy_info: Dict[str, Any]):
         """全局价格订阅任务（所有连接共享，内部管理数据库会话）"""
-        use_polling = False
+        use_polling = settings.FAILSAFE_POLLING_MODE
         
         # 先尝试使用 WebSocket（如果启用）
-        if settings.WS_ENABLED:
+        if settings.WS_ENABLED and not use_polling:
             try:
                 logger.debug(f"尝试使用 WebSocket 订阅 {symbol} 实时价格")
                 # 尝试使用 WebSocket 订阅
@@ -193,6 +194,7 @@ class ConnectionManager:
                             'timestamp': ticker.get('timestamp', 0)
                         }
                         
+                        monitoring.record_event("price.update", tags={"symbol": symbol, "source": "ws"})
                         # 广播给所有连接的客户端（不传入db，让方法自己管理）
                         await self._broadcast_price_update(symbol, current_price)
             except asyncio.CancelledError:
@@ -207,10 +209,14 @@ class ConnectionManager:
         
         # 使用轮询模式（WebSocket 失败或未启用时）
         if use_polling:
-            logger.info(f"使用轮询模式获取 {symbol} 价格（每2秒）")
+            interval = settings.WS_POLLING_INTERVAL or 2.0
+            logger.info(f"使用轮询模式获取 {symbol} 价格（每{interval}秒）")
             while symbol in self.subscription_refs and self.subscription_refs[symbol] > 0:
                 try:
-                    ticker = exchange_service.exchange.fetch_ticker(symbol)
+                    ticker = await exchange_service.fetch_ticker_async(symbol, use_cache=False)
+                    if not ticker:
+                        await asyncio.sleep(interval)
+                        continue
                     current_price = ticker.get('last', 0)
                     
                     if current_price > 0:
@@ -230,9 +236,10 @@ class ConnectionManager:
                             'timestamp': ticker.get('timestamp', 0)
                         }
                         
+                        monitoring.record_event("price.update", tags={"symbol": symbol, "source": "poll"})
                         await self._broadcast_price_update(symbol, current_price)
                     
-                    await asyncio.sleep(2)  # 每2秒轮询一次
+                    await asyncio.sleep(interval)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:

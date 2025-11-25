@@ -10,6 +10,8 @@ from app.models import Position, Order, UserStrategy, PnLRecord
 from app.models.trade import OrderStatus, OrderSide, OrderType
 from app.services.exchange_service import ExchangeService
 from app.services.strategy_engine import StrategyEngine
+from app.services.ohlcv_cache import get_ohlcv_cache
+from app.core.config import settings
 import pandas as pd
 import re
 
@@ -35,7 +37,8 @@ class TradingEngine:
         self.exchange_service = exchange_service
         self.strategy_engine = strategy_engine
         self.strategy_module = None
-        self.ohlcv_cache: Dict[str, Dict[str, Any]] = {}  # 缓存OHLCV数据
+        # 使用全局共享的OHLCV缓存
+        self.ohlcv_cache = get_ohlcv_cache(ttl_seconds=settings.CACHE_OHLCV_TTL)
         
         # 加载策略
         self._load_strategy()
@@ -164,22 +167,22 @@ class TradingEngine:
                         limit: int = 100) -> Optional[pd.DataFrame]:
         """
         步骤3: 下载交易对列表的OHLCV数据
-        每个K线周期仅执行一次，以避免不必要的网络流量
+        使用全局共享缓存，多个策略可以共享相同交易对的K线数据
         """
         # 使用用户配置的时间周期，如果没有则使用默认值
         if timeframe is None:
             timeframe = self.user_strategy.timeframe if self.user_strategy.timeframe else '1h'
         
-        cache_key = f"{symbol}_{timeframe}"
+        # 从全局共享缓存获取
+        exchange_name = self.exchange_service.exchange_name
+        cached_df = self.ohlcv_cache.get(exchange_name, symbol, timeframe)
+        if cached_df is not None:
+            logger.debug(f"从共享缓存获取OHLCV数据: {exchange_name}:{symbol}:{timeframe}")
+            return cached_df
         
-        # 检查缓存
-        if cache_key in self.ohlcv_cache:
-            cached_data = self.ohlcv_cache[cache_key]
-            # 如果缓存时间在5分钟内，直接返回
-            if (datetime.now() - cached_data['timestamp']).seconds < 300:
-                return cached_data['dataframe']
-        
+        # 缓存未命中，从交易所获取
         try:
+            logger.debug(f"从交易所获取OHLCV数据: {exchange_name}:{symbol}:{timeframe}")
             ohlcv = self.exchange_service.fetch_ohlcv(symbol, timeframe, limit=limit)
             if not ohlcv:
                 return None
@@ -189,11 +192,8 @@ class TradingEngine:
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
             
-            # 更新缓存
-            self.ohlcv_cache[cache_key] = {
-                'dataframe': df,
-                'timestamp': datetime.now()
-            }
+            # 存储到全局共享缓存
+            self.ohlcv_cache.set(exchange_name, symbol, timeframe, df)
             
             return df
         except Exception as e:

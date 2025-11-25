@@ -134,6 +134,10 @@ class ExchangeService:
         
         return config
     
+    async def _to_thread(self, func, *args, **kwargs):
+        """统一的线程池调用入口"""
+        return await asyncio.to_thread(func, *args, **kwargs)
+    
     def _create_exchange(self) -> ccxt.Exchange:
         """创建交易所实例"""
         # 验证交易所名称
@@ -260,6 +264,110 @@ class ExchangeService:
         except Exception as e:
             logger.error(f"获取可交易对列表失败: {e}")
             raise
+    
+    async def get_tradable_symbols_async(self, force_refresh: bool = False) -> List[str]:
+        """
+        异步获取可交易的交易对列表（永续合约）
+        
+        Args:
+            force_refresh: 是否强制刷新，忽略缓存
+        
+        Returns:
+            可交易对列表
+        """
+        try:
+            # 使用异步方法获取市场信息
+            markets = await self.get_markets_async(force_refresh=force_refresh)
+            # 筛选永续合约
+            tradable = [
+                symbol for symbol, market in markets.items()
+                if market.get('swap', False) and market.get('active', False)
+            ]
+            return tradable
+        except Exception as e:
+            logger.error(f"异步获取可交易对列表失败: {e}")
+            raise
+    
+    async def get_markets_async(self, force_refresh: bool = False) -> Dict:
+        """
+        异步获取市场信息（使用缓存）
+        
+        Args:
+            force_refresh: 是否强制刷新，忽略缓存
+        
+        Returns:
+            市场信息字典
+        """
+        try:
+            # 使用缓存服务
+            from app.services.cache import cache_service
+            cache_key = f"markets:{self.exchange_name}"
+            
+            if not force_refresh:
+                cached = await cache_service.get(cache_key)
+                if cached is not None:
+                    return cached
+            
+            # 在线程池中执行同步调用
+            markets = await self._to_thread(self.exchange.load_markets)
+            
+            # 缓存结果（市场信息变化不频繁，缓存10分钟）
+            await cache_service.set(
+                cache_key, 
+                markets, 
+                ttl=600  # 10分钟
+            )
+            
+            return markets
+        except Exception as e:
+            logger.error(f"异步获取市场信息失败: {e}")
+            raise
+    
+    async def get_ticker_price_async(
+        self,
+        symbol: str,
+        use_cache: bool = True,
+        cache_ttl: Optional[float] = None
+    ) -> float:
+        """
+        异步获取指定交易对的最新价格（支持缓存）
+        
+        Args:
+            symbol: 交易对，例如 'BTC/USDT:USDT'
+            use_cache: 是否启用缓存
+            cache_ttl: 缓存有效期（秒）
+        
+        Returns:
+            最新价格（float），获取失败时返回 0.0
+        """
+        cache_key = f"ticker:{self.exchange_name}:{symbol}"
+        ttl = cache_ttl if cache_ttl is not None else settings.CACHE_TICKER_TTL
+        
+        try:
+            if use_cache:
+                from app.services.cache import cache_service
+                cached_price = await cache_service.get(cache_key)
+                if isinstance(cached_price, (int, float)) and cached_price > 0:
+                    return float(cached_price)
+        except Exception as exc:
+            logger.debug(f"读取价格缓存失败 {cache_key}: {exc}")
+        
+        try:
+            ticker = await self._to_thread(self.exchange.fetch_ticker, symbol)
+            price = ticker.get('last') or ticker.get('close') or ticker.get('bid') or ticker.get('ask') or 0.0
+            price = float(price or 0.0)
+            
+            if price > 0 and use_cache:
+                try:
+                    from app.services.cache import cache_service
+                    await cache_service.set(cache_key, price, ttl=ttl)
+                except Exception as exc:
+                    logger.debug(f"写入价格缓存失败 {cache_key}: {exc}")
+            
+            return price
+        except Exception as e:
+            logger.error(f"获取 {symbol} 当前价格失败: {e}")
+            return 0.0
     
     def fetch_ohlcv(self, symbol: str, timeframe: str = '1h', 
                    since: Optional[int] = None, limit: int = 100) -> List:

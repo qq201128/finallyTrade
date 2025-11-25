@@ -31,6 +31,22 @@ class Settings(BaseSettings):
     
     # WebSocket配置
     WS_ENABLED: bool = True
+    FAILSAFE_POLLING_MODE: bool = False  # 当WebSocket不可靠时强制使用轮询
+    WS_POLLING_INTERVAL: float = 2.0  # 轮询间隔秒
+    
+    # 缓存与Redis配置
+    CACHE_BACKEND: str = "memory"  # memory 或 redis
+    REDIS_URL: Optional[str] = None
+    CACHE_DEFAULT_TTL: int = 60
+    CACHE_MARKETS_TTL: int = 300
+    CACHE_TRADABLE_TTL: int = 120
+    CACHE_TICKER_TTL: float = 1.0
+    CACHE_OHLCV_TTL: int = 300  # OHLCV数据缓存有效期（秒），默认5分钟
+    
+    # 监控与降级
+    MONITORING_ENABLED: bool = False
+    MONITORING_NAMESPACE: str = "trading_app"
+    MONITORING_SAMPLE_RATE: float = 1.0  # 0~1之间
     
     class Config:
         env_file = ".env"

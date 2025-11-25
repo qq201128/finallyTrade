@@ -15,7 +15,14 @@
           <p class="header-subtitle">登录您的交易账户</p>
         </div>
       </template>
-      <el-form :model="form" :rules="rules" ref="formRef" label-width="0" class="login-form">
+      <el-form 
+        :model="form" 
+        :rules="rules" 
+        ref="formRef" 
+        label-width="0" 
+        class="login-form"
+        @submit.prevent="handleLogin"
+      >
         <el-form-item prop="username">
           <el-input 
             v-model="form.username" 
@@ -90,11 +97,19 @@ export default {
       ]
     }
     
-    const handleLogin = async () => {
+    const handleLogin = async (e) => {
+      // 阻止表单默认提交行为
+      if (e && e.preventDefault) {
+        e.preventDefault()
+      }
+      
       if (!formRef.value) return
       
       await formRef.value.validate(async (valid) => {
         if (valid) {
+          // 保存用户名，防止被清空
+          const savedUsername = form.username
+          
           loading.value = true
           const result = await store.dispatch('auth/login', form)
           loading.value = false
@@ -103,7 +118,29 @@ export default {
             ElMessage.success('登录成功')
             router.push('/dashboard')
           } else {
-            ElMessage.error(result.error)
+            // 显示错误提示，使用配置对象确保 duration 生效（6秒）
+            ElMessage({
+              message: result.error || '登录失败',
+              type: 'error',
+              duration: 6000,
+              showClose: true
+            })
+            
+            // 登录失败时，确保用户名保留，只清空密码
+            form.username = savedUsername
+            form.password = ''
+            
+            // 清除密码字段的验证状态
+            if (formRef.value) {
+              formRef.value.clearValidate('password')
+            }
+            
+            // 让密码输入框重新获得焦点
+            await formRef.value.$nextTick()
+            const passwordInput = formRef.value.$el?.querySelector('input[type="password"]')
+            if (passwordInput) {
+              passwordInput.focus()
+            }
           }
         }
       })

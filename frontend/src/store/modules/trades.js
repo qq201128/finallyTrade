@@ -16,7 +16,8 @@ const mutations = {
       state.positions = []
       return
     }
-    state.positions = positions
+    // 过滤掉已平仓的持仓，只保留未平仓的
+    state.positions = positions.filter(p => p.is_open !== false && p.is_open !== 0)
   },
   SET_LOADING_POSITIONS(state, loading) {
     state.loadingPositions = loading

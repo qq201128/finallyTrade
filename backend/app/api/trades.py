@@ -12,6 +12,7 @@ from app.models.strategy import UserStrategy
 from app.models.user import User
 from app.api.auth import get_current_user
 from app.services.exchange_service import ExchangeService
+from app.core.config import settings
 import logging
 import re
 import asyncio
@@ -192,12 +193,8 @@ async def _fetch_ticker_price(exchange_service: ExchangeService, symbol: str) ->
         if cached_price is not None:
             return cached_price
         
-        # 从交易所获取（同步方法在线程池中执行）
-        ticker = await asyncio.to_thread(
-            exchange_service.exchange.fetch_ticker,
-            symbol
-        )
-        current_price = ticker.get('last', 0)
+        # 使用交易所服务的异步获取方法（内部封装线程池+局部缓存）
+        current_price = await exchange_service.get_ticker_price_async(symbol)
         
         if current_price and current_price > 0:
             _set_cached_price(symbol, current_price, exchange_service.exchange.id if hasattr(exchange_service, 'exchange') else "")
@@ -712,8 +709,11 @@ async def close_position(
                     api_key=user_strategy.api_key,
                     api_secret=user_strategy.api_secret
                 )
-                ticker = exchange_service.exchange.fetch_ticker(position.symbol)
-                current_price = ticker.get('last', 0)
+                current_price = await exchange_service.get_ticker_price_async(
+                    position.symbol,
+                    use_cache=False,
+                    cache_ttl=settings.CACHE_TICKER_TTL
+                )
                 if current_price > 0:
                     position.current_price = current_price
             except Exception as e:

@@ -311,8 +311,10 @@ export default {
     
     const positions = computed(() => {
       const positionsList = store.state.trades.positions || []
+      // 过滤掉已平仓的持仓
+      const openPositions = positionsList.filter(p => p.is_open !== false && p.is_open !== 0)
       // 确保每个持仓都有必要的字段
-      return positionsList.map(position => {
+      return openPositions.map(position => {
         const normalized = {
           ...position,
           side: position.side || 'long',
@@ -332,14 +334,29 @@ export default {
     })
     
     // 筛选后的持仓
+    const sortPositions = (list) => {
+      return [...list].sort((a, b) => {
+        const symbolA = (a.symbol || '').toUpperCase()
+        const symbolB = (b.symbol || '').toUpperCase()
+        if (symbolA !== symbolB) {
+          return symbolA.localeCompare(symbolB, 'en')
+        }
+        if (a.side === b.side) {
+          return 0
+        }
+        // 做多排在做空之前，方便对比
+        return a.side === 'long' ? -1 : 1
+      })
+    }
+
     const filteredPositions = computed(() => {
-      if (positionFilter.value === 'all') {
-        return positions.value
-      } else if (positionFilter.value === 'long') {
-        return positions.value.filter(p => p.side === 'long')
-      } else {
-        return positions.value.filter(p => p.side === 'short')
+      let baseList = positions.value
+      if (positionFilter.value === 'long') {
+        baseList = positions.value.filter(p => p.side === 'long')
+      } else if (positionFilter.value === 'short') {
+        baseList = positions.value.filter(p => p.side === 'short')
       }
+      return sortPositions(baseList)
     })
     
     // 持仓统计
