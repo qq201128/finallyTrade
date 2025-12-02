@@ -10,40 +10,168 @@
 
 注意：使用此策略需要在前端配置中开启"双向交易"选项。
 """
+import logging
 import talib
 import numpy as np
 import pandas as pd
 from app.strategies.base_strategy import BaseStrategy
 
+logger = logging.getLogger(__name__)
+
 def _get_strategy_state(user_strategy):
     """从数据库配置中获取策略状态，如果不存在则初始化"""
-    if not user_strategy.config:
-        user_strategy.config = {}
+    if not user_strategy:
+        return {
+            'long': {
+                'wins': 0,
+                'last_trend': None,
+                'replenish_pool': []
+            },
+            'short': {
+                'wins': 0,
+                'last_trend': None,
+                'replenish_pool': []
+            }
+        }
     
-    if 'replenish_state' not in user_strategy.config:
-        user_strategy.config['replenish_state'] = {
-    'long': {
-        'wins': 0,
-        'last_trend': None,
-        'replenish_pool': []
-    },
-    'short': {
-        'wins': 0,
-        'last_trend': None,
-        'replenish_pool': []
-    }
-}
+    # 安全地访问 user_strategy.config
+    try:
+        config = user_strategy.config
+    except Exception as e:
+        # UserStrategy 对象已过期或已被删除
+        logger.warning(f"无法访问 user_strategy.config，对象可能已过期: {e}")
+        return {
+            'long': {
+                'wins': 0,
+                'last_trend': None,
+                'replenish_pool': []
+            },
+            'short': {
+                'wins': 0,
+                'last_trend': None,
+                'replenish_pool': []
+            }
+        }
+    
+    if not config:
+        config = {}
+        # 尝试设置 config（如果 user_strategy 仍然有效）
+        try:
+            user_strategy.config = config
+        except Exception:
+            # 如果无法设置，继续使用空字典
+            pass
+    
+    if 'replenish_state' not in config:
+        config['replenish_state'] = {
+            'long': {
+                'wins': 0,
+                'last_trend': None,
+                'replenish_pool': []
+            },
+            'short': {
+                'wins': 0,
+                'last_trend': None,
+                'replenish_pool': []
+            }
+        }
+        # 尝试更新 user_strategy.config（如果仍然有效）
+        try:
+            user_strategy.config = config
+        except Exception:
+            # 如果无法更新，继续使用内存中的 config
+            pass
 
-    return user_strategy.config['replenish_state']
+    # 添加调试日志，显示从数据库读取的状态
+    replenish_state = config['replenish_state']
+    logger.debug(f"[读取策略状态] 策略ID: {user_strategy.id if user_strategy else 'N/A'}, "
+                 f"long: wins={replenish_state['long'].get('wins', 0)}, "
+                 f"补仓池={len(replenish_state['long'].get('replenish_pool', []))}, "
+                 f"short: wins={replenish_state['short'].get('wins', 0)}, "
+                 f"补仓池={len(replenish_state['short'].get('replenish_pool', []))}")
+
+    return replenish_state
 
 
 def _save_strategy_state(user_strategy, db):
     """保存策略状态到数据库"""
+    if not db:
+        return
+    
+    # 检查数据库会话是否有效
     try:
-        db.commit()
+        # 检查会话是否已关闭
+        if db.is_active is False:
+            logger.debug("数据库会话已关闭，无法保存策略状态")
+            return
+    except Exception:
+        # 如果无法检查会话状态，尝试继续
+        pass
+    
+    try:
+        # 检查 user_strategy 是否仍然有效
+        if user_strategy:
+            try:
+                strategy_id = user_strategy.id
+            except Exception:
+                logger.debug("user_strategy 已过期，无法保存策略状态")
+                return
+            
+            # 确保 config 被正确设置
+            if not user_strategy.config:
+                user_strategy.config = {}
+            
+            # 关键修复：确保 SQLAlchemy 检测到 JSON 字段的修改
+            # 需要显式标记 config 字段为已修改，否则 SQLAlchemy 可能不会保存
+            from sqlalchemy.orm.attributes import flag_modified
+            
+            # 标记 config 字段为已修改（必须在修改后立即调用）
+            flag_modified(user_strategy, 'config')
+            
+            logger.debug(f"[保存策略状态] 策略ID: {strategy_id}, config: {user_strategy.config}")
+            
+            # 先 flush 确保数据写入
+            try:
+                db.flush()
+            except Exception as e:
+                logger.warning(f"flush 策略状态失败: {e}，尝试 rollback 后重试")
+                try:
+                    if db.is_active:
+                        db.rollback()
+                        # 重新标记并重试
+                        flag_modified(user_strategy, 'config')
+                        db.flush()
+                    else:
+                        logger.warning("数据库会话已关闭，无法重试")
+                        return
+                except Exception as retry_error:
+                    logger.error(f"重试 flush 也失败: {retry_error}")
+                    # 不抛出异常，避免影响主流程
+                    return
+        
+        # 提交事务（如果会话仍然有效）
+        try:
+            if db.is_active:
+                db.commit()
+                logger.debug(f"[保存策略状态] 成功保存到数据库")
+            else:
+                logger.warning("数据库会话已关闭，无法提交")
+        except Exception as commit_error:
+            logger.warning(f"commit 失败: {commit_error}")
+            try:
+                if db.is_active:
+                    db.rollback()
+            except Exception:
+                pass
+            # 不抛出异常，避免影响主流程
     except Exception as e:
-        print(f"[错误] 保存策略状态失败: {e}")
-        db.rollback()
+        logger.warning(f"保存策略状态失败: {e}", exc_info=True)
+        try:
+            # 如果提交失败，尝试回滚
+            if hasattr(db, 'is_active') and db.is_active:
+                db.rollback()
+        except Exception as rollback_error:
+            logger.debug(f"回滚失败: {rollback_error}")
 
 
 def _reset_state(user_strategy, db):
@@ -58,36 +186,76 @@ def _reset_state(user_strategy, db):
 
 def _record_win(side: str, position_size: float, user_strategy, db):
     """记录方向盈利，用于生成补仓机会"""
-    state = _get_strategy_state(user_strategy)
-    state[side]['wins'] = state[side].get('wins', 0) + 1
-    if state[side]['wins'] % 4 == 0 and position_size:
-        opposite = 'short' if side == 'long' else 'long'
-        replenish_amount = max(position_size * 0.5, 0)
-        if replenish_amount > 0:
-            if 'replenish_pool' not in state[opposite]:
-                state[opposite]['replenish_pool'] = []
-            state[opposite]['replenish_pool'].append(replenish_amount)
-            _save_strategy_state(user_strategy, db)
+    if not user_strategy or not db:
+        return
+    
+    try:
+        # 检查 user_strategy 是否仍然有效
+        _ = user_strategy.id
+    except Exception:
+        logger.debug("user_strategy 已过期，跳过记录盈利")
+        return
+    
+    try:
+        state = _get_strategy_state(user_strategy)
+        state[side]['wins'] = state[side].get('wins', 0) + 1
+        wins_count = state[side]['wins']
+        logger.info(f"[盈利记录] 方向: {side}, 盈利次数: {wins_count}, 持仓数量: {position_size}")
+        
+        # 每次盈利都保存状态，确保盈利次数不会丢失
+        _save_strategy_state(user_strategy, db)
+        
+        # 每4次盈利为相反方向生成补仓额度
+        if wins_count % 4 == 0 and position_size:
+            opposite = 'short' if side == 'long' else 'long'
+            replenish_amount = max(position_size * 0.5, 0)
+            if replenish_amount > 0:
+                if 'replenish_pool' not in state[opposite]:
+                    state[opposite]['replenish_pool'] = []
+                state[opposite]['replenish_pool'].append(replenish_amount)
+                logger.info(f"[补仓额度生成] {side}方向盈利{wins_count}次，为{opposite}方向生成补仓额度: {replenish_amount}, "
+                          f"{opposite}方向当前补仓池: {state[opposite]['replenish_pool']}")
+                _save_strategy_state(user_strategy, db)
+    except Exception as e:
+        logger.debug(f"记录盈利失败: {e}")
 
 
 def _update_trend_state(side: str, roi: float, user_strategy, db):
     """监控趋势反转：盈利 -> 亏损 或 亏损 -> 盈利"""
     if roi is None:
         return
-    state = _get_strategy_state(user_strategy)
-    if roi > 0:
-        trend = 'profit'
-    elif roi < 0:
-        trend = 'loss'
-    else:
-        trend = 'flat'
-    last = state[side].get('last_trend')
-    if last and trend in ('profit', 'loss') and trend != last:
-        _reset_state(user_strategy, db)
-        state = _get_strategy_state(user_strategy)  # 重新获取重置后的状态
-    if trend in ('profit', 'loss'):
-        state[side]['last_trend'] = trend
-        _save_strategy_state(user_strategy, db)
+    if not user_strategy or not db:
+        return
+    
+    try:
+        # 检查 user_strategy 是否仍然有效
+        _ = user_strategy.id
+    except Exception:
+        logger.debug("user_strategy 已过期，跳过趋势状态更新")
+        return
+    
+    try:
+        state = _get_strategy_state(user_strategy)
+        if roi > 0:
+            trend = 'profit'
+        elif roi < 0:
+            trend = 'loss'
+        else:
+            trend = 'flat'
+        last = state[side].get('last_trend')
+        
+        # 重要：只有在真正发生趋势反转时才重置（从盈利转为亏损，或从亏损转为盈利）
+        # 但要注意：如果持仓一直亏损，不应该因为价格波动而重置状态
+        if last and trend in ('profit', 'loss') and trend != last:
+            logger.warning(f"[趋势反转] {side}方向从 {last} 转为 {trend}，重置所有状态（包括补仓池）")
+            _reset_state(user_strategy, db)
+            state = _get_strategy_state(user_strategy)  # 重新获取重置后的状态
+        
+        if trend in ('profit', 'loss'):
+            state[side]['last_trend'] = trend
+            _save_strategy_state(user_strategy, db)
+    except Exception as e:
+        logger.debug(f"更新趋势状态失败: {e}")
 
 def populate_indicators(dataframe, metadata):
     """
@@ -190,64 +358,127 @@ class BidirectionalExampleStrategy(BaseStrategy):
         Returns:
             dict或None: 如果返回dict，包含退出信息
         """
-        if not position or not position.entry_price or position.entry_price <= 0 or not current_price:
-            return None
-        
-        # 获取 user_strategy 和 db（如果未传递）
-        if not user_strategy and hasattr(position, 'user_strategy'):
-            user_strategy = position.user_strategy
-        if not db and user_strategy and hasattr(user_strategy, '_sa_instance_state'):
-            # 尝试从 user_strategy 获取数据库会话
-            from sqlalchemy.orm import object_session
-            db = object_session(user_strategy) if user_strategy else None
-        
-        # 计算盈亏比例（根据持仓方向）
-        if position.side == 'long':
-            roi = (current_price - position.entry_price) / position.entry_price
-        else:
-            roi = (position.entry_price - current_price) / position.entry_price
-        
-        if user_strategy and db:
-            _update_trend_state(position.side, roi, user_strategy, db)
-        
-        # 计算杠杆后的盈亏百分比（基于保证金）
-        leverage = getattr(position, 'leverage', 1) or 1
-        if leverage <= 0:
-            leverage = 1
-        
-        # 计算保证金
-        position_size = abs(position.size or 0)
-        margin_used = (position.entry_price * position_size) / leverage
-        
-        # 计算基于保证金的盈亏百分比
-        # 优先使用已计算的 unrealized_pnl
-        unrealized_pnl = getattr(position, 'unrealized_pnl', None)
-        if unrealized_pnl is None:
-            # 如果 unrealized_pnl 未设置，手动计算
-            if position.side == 'long':
-                unrealized_pnl = (current_price - position.entry_price) * position_size
+        try:
+            if not position:
+                return None
+            
+            # 安全地检查 position 是否仍然有效
+            try:
+                position_id = position.id
+                entry_price = position.entry_price
+                if not entry_price or entry_price <= 0 or not current_price:
+                    return None
+            except Exception as e:
+                # Position 对象已被删除或过期
+                logger.debug(f"持仓对象已失效，跳过自定义退出检查: {e}")
+                return None
+            
+            # 安全地访问 position.side
+            try:
+                position_side = position.side
+            except Exception as e:
+                logger.debug(f"无法访问持仓 {position_id} 的 side 属性: {e}")
+                return None
+            
+            # 获取 user_strategy 和 db（如果未传递）
+            if not user_strategy and hasattr(position, 'user_strategy'):
+                try:
+                    user_strategy = position.user_strategy
+                except Exception:
+                    user_strategy = None
+            
+            if not db and user_strategy and hasattr(user_strategy, '_sa_instance_state'):
+                # 尝试从 user_strategy 获取数据库会话
+                from sqlalchemy.orm import object_session
+                try:
+                    db = object_session(user_strategy) if user_strategy else None
+                except Exception:
+                    db = None
+            
+            # 计算盈亏比例（根据持仓方向）
+            if position_side == 'long':
+                roi = (current_price - entry_price) / entry_price
             else:
-                unrealized_pnl = (position.entry_price - current_price) * position_size
-        
-        if margin_used > 0:
-            pnl_percentage = (unrealized_pnl / margin_used) * 100
-        else:
-            # 如果无法计算保证金，使用价格变动计算
-            pnl_percentage = roi * leverage * 100
-        
-        # 注意：亏损时不平仓，通过 adjust_position 进行补仓处理
-        
-        # 止盈：盈利超过保证金50%时平仓（考虑杠杆）
-        if pnl_percentage >= 50:
+                roi = (entry_price - current_price) / entry_price
+            
+            # 安全地访问 user_strategy
             if user_strategy and db:
-                _record_win(position.side, position.size, user_strategy, db)
-            return {
-                'price': current_price,
-                'reason': 'take_profit_50pct',
-                'reduce_percent': 1.0  # 全部平仓
-            }
-        
-        return None
+                try:
+                    # 检查 user_strategy 是否仍然有效
+                    _ = user_strategy.id
+                    _update_trend_state(position_side, roi, user_strategy, db)
+                except Exception as e:
+                    logger.debug(f"无法访问 user_strategy，对象可能已过期: {e}")
+                    user_strategy = None
+                    db = None
+            
+            # 安全地访问 position 的其他属性
+            try:
+                leverage = getattr(position, 'leverage', 1) or 1
+            except Exception as e:
+                logger.debug(f"无法访问持仓 {position_id} 的 leverage 属性: {e}")
+                leverage = 1
+            
+            if leverage <= 0:
+                leverage = 1
+            
+            # 安全地访问 position.size
+            try:
+                position_size = abs(position.size or 0)
+            except Exception as e:
+                logger.debug(f"无法访问持仓 {position_id} 的 size 属性: {e}")
+                return None
+            
+            margin_used = (entry_price * position_size) / leverage
+            
+            # 计算基于保证金的盈亏百分比
+            # 优先使用已计算的 unrealized_pnl
+            try:
+                unrealized_pnl = getattr(position, 'unrealized_pnl', None)
+            except Exception as e:
+                logger.debug(f"无法访问持仓 {position_id} 的 unrealized_pnl 属性: {e}")
+                unrealized_pnl = None
+            
+            if unrealized_pnl is None:
+                # 如果 unrealized_pnl 未设置，手动计算
+                if position_side == 'long':
+                    unrealized_pnl = (current_price - entry_price) * position_size
+                else:
+                    unrealized_pnl = (entry_price - current_price) * position_size
+            
+            if margin_used > 0:
+                pnl_percentage = (unrealized_pnl / margin_used) * 100
+            else:
+                # 如果无法计算保证金，使用价格变动计算
+                pnl_percentage = roi * leverage * 100
+            
+            # 注意：亏损时不平仓，通过 adjust_position 进行补仓处理
+            
+            # 止盈：盈利超过保证金50%时平仓（考虑杠杆）
+            if pnl_percentage >= 50:
+                if user_strategy and db:
+                    try:
+                        # 再次检查 user_strategy 是否仍然有效
+                        _ = user_strategy.id
+                        # 安全地访问 position.size
+                        try:
+                            pos_size = position.size
+                        except Exception:
+                            pos_size = position_size  # 使用之前获取的值
+                        _record_win(position_side, pos_size, user_strategy, db)
+                    except Exception as e:
+                        logger.debug(f"无法记录盈利，user_strategy 可能已过期: {e}")
+                return {
+                    'price': current_price,
+                    'reason': 'take_profit_50pct',
+                    'reduce_percent': 1.0  # 全部平仓
+                }
+            
+            return None
+        except Exception as e:
+            # 捕获所有异常，避免影响主循环
+            logger.error(f"custom_exit 执行失败: {e}", exc_info=True)
+            return None
     
     def adjust_position(self, position, db=None, user_strategy=None):
         """
@@ -266,44 +497,111 @@ class BidirectionalExampleStrategy(BaseStrategy):
         Returns:
             dict: 包含{'should_adjust': bool, 'amount': float}
         """
-        if not position or not position.entry_price or position.entry_price <= 0:
+        try:
+            if not position:
+                return {'should_adjust': False, 'amount': 0}
+            
+            # 安全地访问 position 属性，如果已被删除会抛出异常
+            try:
+                # 尝试访问 position.id 来检查对象是否仍然有效
+                position_id = position.id
+                if not position.is_open:
+                    return {'should_adjust': False, 'amount': 0}
+            except Exception as e:
+                # Position 对象已被删除或过期
+                logger.debug(f"持仓对象已失效，跳过仓位调整: {e}")
+                return {'should_adjust': False, 'amount': 0}
+            
+            if not position.entry_price or position.entry_price <= 0:
+                return {'should_adjust': False, 'amount': 0}
+            
+            current_price = position.current_price
+            if current_price is None or current_price <= 0:
+                return {'should_adjust': False, 'amount': 0}
+            
+            # 安全地访问 position.side
+            try:
+                position_side = position.side
+            except Exception as e:
+                # 如果 position.side 访问失败（对象已过期），直接返回
+                logger.warning(f"无法访问持仓 {position_id} 的 side 属性，可能已被删除: {e}")
+                return {'should_adjust': False, 'amount': 0}
+            
+            # 获取 user_strategy 和 db（如果未传递）
+            if not user_strategy and hasattr(position, 'user_strategy'):
+                try:
+                    user_strategy = position.user_strategy
+                except Exception:
+                    user_strategy = None
+            
+            if not db and user_strategy and hasattr(user_strategy, '_sa_instance_state'):
+                # 尝试从 user_strategy 获取数据库会话
+                from sqlalchemy.orm import object_session
+                db = object_session(user_strategy) if user_strategy else None
+            
+            if position_side == 'long':
+                roi = (current_price - position.entry_price) / position.entry_price
+            else:
+                roi = (position.entry_price - current_price) / position.entry_price
+            
+            # 安全地访问 user_strategy 和 db
+            if user_strategy and db:
+                try:
+                    # 检查 user_strategy 是否仍然有效
+                    _ = user_strategy.id
+                    _update_trend_state(position_side, roi, user_strategy, db)
+                except Exception as e:
+                    logger.debug(f"无法访问 user_strategy，对象可能已过期: {e}")
+                    user_strategy = None
+                    db = None
+            
+            # 仅在亏损且存在补仓额度时执行
+            if user_strategy:
+                try:
+                    # 再次检查 user_strategy 是否仍然有效
+                    _ = user_strategy.id
+                    state = _get_strategy_state(user_strategy)
+                    replenish_pool = state[position_side].get('replenish_pool', [])
+                    wins = state[position_side].get('wins', 0)
+                    
+                    # 获取相反方向的盈利次数（用于生成补仓额度）
+                    opposite_side = 'short' if position_side == 'long' else 'long'
+                    opposite_wins = state[opposite_side].get('wins', 0)
+                    
+                    # 添加详细日志用于诊断（使用DEBUG级别，减少日志噪音）
+                    logger.debug(f"[补仓检查] 持仓ID: {position_id}, 方向: {position_side}, ROI: {roi:.4f}, "
+                              f"亏损: {roi < 0}, 补仓池: {len(replenish_pool)}个额度, "
+                              f"{opposite_side}方向盈利次数: {opposite_wins} (每4次为{position_side}生成1次补仓额度), "
+                              f"补仓池详情: {replenish_pool}")
+                    
+                    if roi < 0 and replenish_pool:
+                        amount = replenish_pool.pop(0)
+                        amount = max(amount, 0)
+                        if amount > 0:
+                            logger.info(f"[补仓触发] 持仓ID: {position_id}, 方向: {position_side}, "
+                                      f"补仓数量: {amount}, 剩余补仓额度: {len(replenish_pool)}")
+                            if db:
+                                try:
+                                    _save_strategy_state(user_strategy, db)
+                                except Exception as e:
+                                    logger.warning(f"保存策略状态失败: {e}")
+                            return {
+                                'should_adjust': True,
+                                'amount': amount
+                            }
+                    elif roi < 0:
+                        # 亏损但无补仓额度是正常情况，使用DEBUG级别
+                        logger.debug(f"[补仓未触发] 持仓ID: {position_id}, 方向: {position_side}, "
+                                     f"亏损但无补仓额度。{opposite_side}方向盈利次数: {opposite_wins}, "
+                                     f"需要{opposite_side}方向盈利平仓4次才能为{position_side}方向生成1次补仓额度")
+                except Exception as e:
+                    logger.debug(f"无法获取策略状态，user_strategy 可能已过期: {e}")
+            
             return {'should_adjust': False, 'amount': 0}
-        
-        current_price = position.current_price
-        if current_price is None or current_price <= 0:
+        except Exception as e:
+            # 捕获所有异常，避免影响主循环
+            logger.error(f"adjust_position 执行失败: {e}", exc_info=True)
             return {'should_adjust': False, 'amount': 0}
-        
-        # 获取 user_strategy 和 db（如果未传递）
-        if not user_strategy and hasattr(position, 'user_strategy'):
-            user_strategy = position.user_strategy
-        if not db and user_strategy and hasattr(user_strategy, '_sa_instance_state'):
-            # 尝试从 user_strategy 获取数据库会话
-            from sqlalchemy.orm import object_session
-            db = object_session(user_strategy) if user_strategy else None
-        
-        if position.side == 'long':
-            roi = (current_price - position.entry_price) / position.entry_price
-        else:
-            roi = (position.entry_price - current_price) / position.entry_price
-        
-        if user_strategy and db:
-            _update_trend_state(position.side, roi, user_strategy, db)
-        
-        # 仅在亏损且存在补仓额度时执行
-        if user_strategy:
-            state = _get_strategy_state(user_strategy)
-            replenish_pool = state[position.side].get('replenish_pool', [])
-            if roi < 0 and replenish_pool:
-                amount = replenish_pool.pop(0)
-                amount = max(amount, 0)
-                if amount > 0:
-                    _save_strategy_state(user_strategy, db)
-                    return {
-                        'should_adjust': True,
-                        'amount': amount
-                    }
-        
-        return {'should_adjust': False, 'amount': 0}
 
 
 # 创建策略实例（策略引擎会自动从实例中获取方法，无需手动导出）

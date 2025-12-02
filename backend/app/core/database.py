@@ -15,6 +15,23 @@ logger = logging.getLogger(__name__)
 if "sqlite" in settings.DATABASE_URL:
     # SQLite 使用 StaticPool，适合多线程环境
     # StaticPool 会为每个线程创建独立的连接，避免连接池溢出
+    # 启用WAL模式提高并发性能，减少锁定问题
+    def _set_sqlite_pragma(dbapi_conn, connection_record):
+        """设置SQLite的PRAGMA参数，优化多线程并发性能"""
+        try:
+            # 启用WAL模式（Write-Ahead Logging），提高并发性能
+            dbapi_conn.execute("PRAGMA journal_mode=WAL")
+            # 设置忙等待超时（毫秒），避免数据库锁定
+            dbapi_conn.execute("PRAGMA busy_timeout=30000")  # 30秒
+            # 启用外键约束
+            dbapi_conn.execute("PRAGMA foreign_keys=ON")
+            # 设置同步模式为NORMAL（WAL模式下推荐）
+            dbapi_conn.execute("PRAGMA synchronous=NORMAL")
+            # 设置缓存大小（64MB），提高性能
+            dbapi_conn.execute("PRAGMA cache_size=-65536")  # 64MB
+        except Exception as e:
+            logger.warning(f"设置SQLite PRAGMA失败: {e}")
+    
     engine = create_engine(
         settings.DATABASE_URL,
         poolclass=StaticPool,
@@ -25,7 +42,9 @@ if "sqlite" in settings.DATABASE_URL:
         pool_pre_ping=True,  # 连接前检查连接是否有效
         echo=False
     )
-    logger.info("使用 SQLite 数据库，配置为 StaticPool（多线程安全）")
+    # 注册事件监听器，在连接创建时设置PRAGMA（使用新API）
+    event.listen(engine, "connect", _set_sqlite_pragma)
+    logger.info("使用 SQLite 数据库，配置为 StaticPool（多线程安全），已启用WAL模式")
 else:
     # PostgreSQL/MySQL 等使用连接池
     # 多用户场景：假设每个用户平均3个策略，10个用户需要30个连接
@@ -76,11 +95,15 @@ class DBSessionManager:
     """
     数据库会话上下文管理器
     确保会话在使用后正确关闭，避免连接泄漏
+    针对SQLite多线程并发进行了优化
     """
     def __init__(self):
         self.db = None
+        self.retry_count = 0
+        self.max_retries = 3
     
     def __enter__(self):
+        # 创建新的数据库会话
         self.db = SessionLocal()
         return self.db
     
@@ -88,13 +111,39 @@ class DBSessionManager:
         if self.db is not None:
             try:
                 if exc_type is not None:
-                    self.db.rollback()
+                    # 发生异常时回滚
+                    try:
+                        self.db.rollback()
+                    except Exception as rollback_error:
+                        logger.warning(f"回滚数据库会话失败: {rollback_error}")
                 else:
-                    self.db.commit()
+                    # 正常情况提交事务
+                    try:
+                        self.db.commit()
+                    except Exception as commit_error:
+                        # 如果是数据库锁定错误，尝试重试
+                        error_str = str(commit_error).lower()
+                        if "locked" in error_str or "database is locked" in error_str:
+                            logger.warning(f"数据库锁定，尝试回滚后重试: {commit_error}")
+                            try:
+                                self.db.rollback()
+                                # 等待一小段时间后重试提交
+                                import time
+                                time.sleep(0.1)
+                                self.db.commit()
+                            except Exception as retry_error:
+                                logger.error(f"重试提交失败: {retry_error}")
+                                self.db.rollback()
+                        else:
+                            logger.error(f"数据库会话提交失败: {commit_error}", exc_info=True)
+                            self.db.rollback()
             except Exception as e:
-                logger.error(f"数据库会话提交/回滚失败: {e}", exc_info=True)
-                if self.db is not None:
-                    self.db.rollback()
+                logger.error(f"数据库会话处理失败: {e}", exc_info=True)
+                try:
+                    if self.db is not None:
+                        self.db.rollback()
+                except Exception:
+                    pass
             finally:
                 try:
                     self.db.close()

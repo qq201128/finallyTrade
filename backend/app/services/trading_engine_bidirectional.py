@@ -125,6 +125,9 @@ class BidirectionalTradingEngine:
             symbol: 交易对（可选）
             side: 方向 'long' 或 'short'（可选）
         """
+        # 确保查询时能看到未提交的更改
+        self.db.flush()
+        
         query = self.db.query(Position).filter(
             Position.user_id == self.user_strategy.user_id,
             Position.user_strategy_id == self.user_strategy.id,
@@ -137,7 +140,9 @@ class BidirectionalTradingEngine:
         if side:
             query = query.filter(Position.side == side)
         
-        return query.all()
+        positions = query.all()
+        logger.debug(f"查询持仓: symbol={symbol}, side={side}, 找到 {len(positions)} 个持仓")
+        return positions
     
     def get_tradable_symbols(self) -> List[str]:
         """获取可交易的交易对列表"""
@@ -574,9 +579,11 @@ class BidirectionalTradingEngine:
             
             # 更新持仓
             position.size -= order.filled
+            position_was_closed = False
             if position.size <= 0:
                 position.is_open = False
                 position.closed_at = datetime.now()
+                position_was_closed = True
                 
                 timeframe = self.user_strategy.timeframe if self.user_strategy.timeframe else '1h'
                 close_candle_timestamp = self._get_candle_start_timestamp(datetime.now(), timeframe)
@@ -606,20 +613,118 @@ class BidirectionalTradingEngine:
             self.db.add(pnl_record)
             self.db.commit()
             logger.info(f"关闭持仓: {position.id}, 方向: {position.side}, 盈亏: {realized_pnl}")
+            
+            # 如果是盈利平仓，记录盈利次数（用于生成补仓额度）
+            if realized_pnl > 0:
+                try:
+                    from app.strategies.bidirectional_example_strategy import _record_win
+                    position_size = abs(position.size or order.filled or 0)
+                    if position_size > 0:
+                        _record_win(position.side, position_size, self.user_strategy, self.db)
+                except ImportError:
+                    # 如果不是双向交易策略，跳过
+                    pass
+                except Exception as e:
+                    logger.debug(f"记录盈利失败: {e}")
+            
+            # 如果持仓已完全关闭，推送 WebSocket 更新通知前端
+            if position_was_closed:
+                try:
+                    import asyncio
+                    from app.api.websocket import manager
+                    
+                    # 创建异步任务推送 WebSocket 更新
+                    position_data = {
+                        "id": position.id,
+                        "symbol": position.symbol,
+                        "side": position.side,
+                        "size": 0,
+                        "entry_price": position.entry_price,
+                        "current_price": exit_price,
+                        "unrealized_pnl": 0,
+                        "leverage": position.leverage or 1,
+                        "margin_used": 0,
+                        "pnl_percentage": 0,
+                        "is_open": False
+                    }
+                    message = {
+                        "type": "positions",
+                        "data": [position_data]
+                    }
+                    
+                    # 在后台线程中运行异步推送（交易引擎在独立线程中运行）
+                    # 使用 asyncio.run 在 Python 3.7+ 中安全运行
+                    try:
+                        # 尝试获取当前事件循环
+                        try:
+                            loop = asyncio.get_running_loop()
+                            # 如果有运行中的事件循环，使用 create_task
+                            asyncio.create_task(self._push_position_update_async(message, position.user_id))
+                        except RuntimeError:
+                            # 没有运行中的事件循环，使用 asyncio.run
+                            asyncio.run(self._push_position_update_async(message, position.user_id))
+                    except Exception as e:
+                        logger.warning(f"推送平仓 WebSocket 更新失败: {e}")
+                except Exception as e:
+                    logger.warning(f"推送平仓 WebSocket 更新失败: {e}")
         except Exception as e:
             logger.error(f"关闭持仓失败: {e}")
             self.db.rollback()
+    
+    async def _push_position_update_async(self, message: dict, user_id: int):
+        """异步推送持仓更新到 WebSocket"""
+        try:
+            from app.api.websocket import manager
+            # 发送给该用户的所有连接
+            for connection in manager.active_connections:
+                connection_user_id = manager.connection_users.get(connection)
+                if connection_user_id == user_id:
+                    try:
+                        await manager.send_personal_message(message, connection)
+                    except Exception as e:
+                        logger.debug(f"推送平仓更新失败: {e}")
+        except Exception as e:
+            logger.warning(f"推送 WebSocket 更新失败: {e}")
     
     def adjust_position_size(self, position: Position):
         """
         仓位调整（支持双向补仓）
         """
-        if not self.user_strategy.config.get('position_adjustment', False):
+        position_adjustment_enabled = self.user_strategy.config.get('position_adjustment', False)
+        if not position_adjustment_enabled:
+            logger.debug(f"[仓位调整] 持仓ID: {position.id if position else 'N/A'}, "
+                        f"仓位调整功能未启用 (position_adjustment={position_adjustment_enabled})")
             return
         
-        adjustment = self.call_strategy_callback('adjust_position', position, self.db, self.user_strategy)
+        # 检查 position 是否仍然存在于数据库中
+        try:
+            # 尝试刷新 position 对象，如果已被删除会抛出异常
+            self.db.refresh(position)
+        except Exception as e:
+            logger.warning(f"持仓 {position.id if position else 'N/A'} 已不存在于数据库中，跳过仓位调整: {e}")
+            return
+        
+        # 再次检查 position 是否仍然开放
+        if not position.is_open:
+            logger.debug(f"持仓 {position.id} 已关闭，跳过仓位调整")
+            return
+        
+        try:
+            adjustment = self.call_strategy_callback('adjust_position', position, self.db, self.user_strategy)
+            logger.debug(f"[仓位调整] 持仓ID: {position.id}, 策略返回: {adjustment}")
+        except Exception as e:
+            logger.error(f"调用策略回调 adjust_position 失败: {e}", exc_info=True)
+            return
+        
         if adjustment and adjustment.get('should_adjust', False):
+            logger.info(f"[仓位调整] 持仓ID: {position.id}, 开始执行补仓，数量: {adjustment.get('amount', 0)}")
             try:
+                # 再次检查 position 是否仍然有效（可能在回调中被删除）
+                self.db.refresh(position)
+                if not position.is_open:
+                    logger.debug(f"持仓 {position.id} 在回调后已关闭，跳过仓位调整")
+                    return
+                
                 amount = adjustment.get('amount', 0)
                 if amount > 0:
                     # 根据持仓方向确定补仓订单方向
@@ -689,9 +794,12 @@ class BidirectionalTradingEngine:
         self._attempt_open_position(symbol, entry_side, analysis_result)
 
     def _attempt_open_position(self, symbol: str, entry_side: str, analysis_result: Dict):
+        # 第一次检查：查询现有持仓
         existing_position = self.get_open_positions(symbol=symbol, side=entry_side)
         if existing_position:
-            self.adjust_position_size(existing_position[0])
+            # 注意：仓位调整已在 run_trading_loop 中统一处理，这里只记录日志
+            # 使用 DEBUG 级别，因为这是正常情况（已有持仓时跳过开仓）
+            logger.debug(f"检测到已有{entry_side}持仓: {symbol}, 持仓ID: {existing_position[0].id}, 跳过开仓")
             return
         
         timeframe = self.user_strategy.timeframe if self.user_strategy.timeframe else '1h'
@@ -704,6 +812,17 @@ class BidirectionalTradingEngine:
         
         entry_conditions = self.call_strategy_callback('entry_conditions', symbol, analysis_result)
         if entry_conditions is False:
+            logger.info(f"入场条件检查未通过: {symbol} {entry_side}方向，跳过开仓")
+            return
+        
+        # 确保数据库中的未提交更改可见（防止并发问题）
+        self.db.flush()
+        
+        # 第二次检查：双重检查锁定，防止并发创建重复持仓
+        existing_position = self.get_open_positions(symbol=symbol, side=entry_side)
+        if existing_position:
+            # 注意：仓位调整已在 run_trading_loop 中统一处理，这里只记录警告
+            logger.warning(f"双重检查发现已有{entry_side}持仓: {symbol}, 持仓ID: {existing_position[0].id}, 跳过开仓（可能是并发导致）")
             return
         
         desired_leverage = self.user_strategy.config.get('leverage', 50) or 50
@@ -857,6 +976,14 @@ class BidirectionalTradingEngine:
             except Exception as e:
                 logger.debug(f"获取 {order.symbol} 杠杆信息失败: {e}，使用默认值 {leverage}x")
             
+            # 再次检查是否已有持仓（防止并发创建）
+            existing_position = self.get_open_positions(symbol=order.symbol, side=side)
+            if existing_position:
+                logger.warning(f"在创建持仓前检测到已有{side}持仓: {order.symbol}, 持仓ID: {existing_position[0].id}, 跳过创建新持仓")
+                order.position_id = existing_position[0].id
+                self.db.commit()
+                return
+            
             position = Position(
                 user_id=order.user_id,
                 user_strategy_id=self.user_strategy.id,
@@ -869,6 +996,8 @@ class BidirectionalTradingEngine:
                 is_open=True
             )
             self.db.add(position)
+            # 先flush以获取position.id（对于自增ID）
+            self.db.flush()
             order.position_id = position.id
             self.db.commit()
             logger.info(f"创建{side}仓: {position.id}, 交易对: {order.symbol}, 数量: {position_size}, "
@@ -953,9 +1082,30 @@ class BidirectionalTradingEngine:
                     
                     self.verify_and_close_positions(symbol, analysis_result)
                     
-                    for position in open_positions:
-                        if position.symbol == symbol:
+                    # 重新获取 open_positions，因为可能在 verify_and_close_positions 中被关闭
+                    # 同时过滤出当前 symbol 的持仓
+                    current_positions = []
+                    try:
+                        all_open_positions = self.get_open_positions()
+                        for pos in all_open_positions:
+                            try:
+                                # 检查 position 是否仍然有效
+                                if pos.symbol == symbol and pos.is_open:
+                                    current_positions.append(pos)
+                            except Exception as e:
+                                # Position 对象已过期或已被删除，跳过
+                                logger.debug(f"跳过已失效的持仓对象: {e}")
+                                continue
+                    except Exception as e:
+                        logger.warning(f"获取持仓列表失败: {e}")
+                    
+                    # 对当前 symbol 的持仓进行仓位调整（统一在这里处理，避免重复调用）
+                    for position in current_positions:
+                        try:
                             self.adjust_position_size(position)
+                        except Exception as e:
+                            logger.error(f"调整持仓 {position.id if position else 'N/A'} 失败: {e}")
+                            continue
                     
                     self.verify_and_open_positions(symbol, analysis_result)
                     
@@ -966,6 +1116,16 @@ class BidirectionalTradingEngine:
             self.call_strategy_callback('after_loop', tradable_symbols)
             
         except Exception as e:
-            logger.error(f"交易循环执行失败: {e}")
+            # 详细记录双向交易循环异常信息
+            exception_type = type(e).__name__
+            exception_message = str(e)
+            user_strategy_id = self.user_strategy.id if self.user_strategy else '未知'
+            logger.error(
+                f"双向交易循环执行异常终止 - "
+                f"策略ID: {user_strategy_id}, "
+                f"异常类型: {exception_type}, "
+                f"异常消息: {exception_message}",
+                exc_info=True
+            )
             raise
 

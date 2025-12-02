@@ -31,11 +31,11 @@ const mutations = {
       positions.forEach(newPos => {
         const index = state.positions.findIndex(p => p.id === newPos.id)
         
-        // 如果持仓已平仓（is_open=false），从列表中移除
-        if (newPos.is_open === false || newPos.is_open === 0) {
+        // 如果持仓已平仓（is_open=false 或 size=0），从列表中移除
+        if (newPos.is_open === false || newPos.is_open === 0 || (newPos.size !== undefined && newPos.size === 0)) {
           if (index > -1) {
             state.positions.splice(index, 1)
-            console.log(`持仓 ${newPos.id} 已平仓，从列表中移除`)
+            console.log(`持仓 ${newPos.id} 已平仓，从列表中移除 (is_open: ${newPos.is_open}, size: ${newPos.size})`)
           }
           return
         }
@@ -59,7 +59,7 @@ const mutations = {
           }
         } else {
           // 只添加未平仓的持仓
-          if (newPos.is_open !== false && newPos.is_open !== 0) {
+          if (newPos.is_open !== false && newPos.is_open !== 0 && newPos.size !== 0) {
             state.positions.push(newPos)
           }
         }
@@ -68,11 +68,11 @@ const mutations = {
       // 单个更新：更新特定持仓
       const index = state.positions.findIndex(p => p.id === positions.id)
       
-      // 如果持仓已平仓，从列表中移除
-      if (positions.is_open === false || positions.is_open === 0) {
+      // 如果持仓已平仓（is_open=false 或 size=0），从列表中移除
+      if (positions.is_open === false || positions.is_open === 0 || (positions.size !== undefined && positions.size === 0)) {
         if (index > -1) {
           state.positions.splice(index, 1)
-          console.log(`持仓 ${positions.id} 已平仓，从列表中移除`)
+          console.log(`持仓 ${positions.id} 已平仓，从列表中移除 (is_open: ${positions.is_open}, size: ${positions.size})`)
         }
         return
       }
@@ -81,7 +81,7 @@ const mutations = {
         state.positions[index] = { ...state.positions[index], ...positions }
       } else {
         // 只添加未平仓的持仓
-        if (positions.is_open !== false && positions.is_open !== 0) {
+        if (positions.is_open !== false && positions.is_open !== 0 && positions.size !== 0) {
           state.positions.push(positions)
         }
       }
@@ -112,9 +112,9 @@ const mutations = {
 }
 
 const actions = {
-  async fetchPositions({ commit, state }, fast = true) {
-    // 如果正在加载，避免重复请求
-    if (state.loadingPositions) {
+  async fetchPositions({ commit, state }, fast = true, force = false) {
+    // 如果正在加载且不是强制刷新，避免重复请求
+    if (state.loadingPositions && !force) {
       return Promise.resolve()
     }
     
@@ -170,14 +170,29 @@ const actions = {
   /**
    * 手动平仓
    */
-  async closePosition({ commit, dispatch }, positionId) {
+  async closePosition({ commit, dispatch, state }, positionId) {
     try {
+      // 先乐观更新：立即从本地 state 中移除该持仓
+      const positionIndex = state.positions.findIndex(p => p.id === positionId)
+      if (positionIndex > -1) {
+        state.positions.splice(positionIndex, 1)
+        console.log(`平仓前乐观更新：从列表中移除持仓 ${positionId}`)
+      }
+      
       const response = await api.post(`/trades/positions/${positionId}/close`)
-      // 平仓成功后，刷新持仓列表
-      await dispatch('fetchPositions')
+      
+      // 平仓成功后，等待一小段时间确保后端事务已提交，然后强制刷新持仓列表
+      // 使用 setTimeout 包装 Promise，确保后端事务已提交
+      await new Promise(resolve => setTimeout(resolve, 300))
+      
+      // 强制刷新持仓列表（即使正在加载也要刷新）
+      await dispatch('fetchPositions', false, true)
+      
       return { success: true, data: response.data }
     } catch (error) {
       console.error('平仓失败:', error)
+      // 如果平仓失败，需要重新获取持仓列表以恢复状态
+      await dispatch('fetchPositions', false, true)
       return { 
         success: false, 
         error: error.response?.data?.detail || error.message || '平仓失败' 

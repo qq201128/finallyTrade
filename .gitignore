@@ -19,6 +19,8 @@ node_modules/
 dist/
 .DS_Store
 *.log
+# 日志目录（运行时生成）
+logs/
 
 # IDE
 .vscode/
@@ -30,3 +32,6 @@ dist/
 .env
 .env.local
 
+.gitignore
+backend/trading_system.db-shm
+backend/trading_system.db-wal

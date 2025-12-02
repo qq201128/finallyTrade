@@ -397,9 +397,11 @@ class TradingEngine:
             
             # 更新持仓
             position.size -= order.filled
+            position_was_closed = False
             if position.size <= 0:
                 position.is_open = False
                 position.closed_at = datetime.now()
+                position_was_closed = True
                 
                 # 记录平仓时的K线周期时间戳，用于防止同一周期内立即开仓
                 timeframe = self.user_strategy.timeframe if self.user_strategy.timeframe else '1h'
@@ -430,9 +432,65 @@ class TradingEngine:
             self.db.add(pnl_record)
             self.db.commit()
             logger.info(f"关闭持仓: {position.id}, 盈亏: {realized_pnl}")
+            
+            # 如果持仓已完全关闭，推送 WebSocket 更新通知前端
+            if position_was_closed:
+                try:
+                    import asyncio
+                    from app.api.websocket import manager
+                    
+                    # 创建异步任务推送 WebSocket 更新
+                    position_data = {
+                        "id": position.id,
+                        "symbol": position.symbol,
+                        "side": position.side,
+                        "size": 0,
+                        "entry_price": position.entry_price,
+                        "current_price": exit_price,
+                        "unrealized_pnl": 0,
+                        "leverage": position.leverage or 1,
+                        "margin_used": 0,
+                        "pnl_percentage": 0,
+                        "is_open": False
+                    }
+                    message = {
+                        "type": "positions",
+                        "data": [position_data]
+                    }
+                    
+                    # 在后台线程中运行异步推送（交易引擎在独立线程中运行）
+                    # 使用 asyncio.run 在 Python 3.7+ 中安全运行
+                    try:
+                        # 尝试获取当前事件循环
+                        try:
+                            loop = asyncio.get_running_loop()
+                            # 如果有运行中的事件循环，使用 create_task
+                            asyncio.create_task(self._push_position_update_async(message, position.user_id))
+                        except RuntimeError:
+                            # 没有运行中的事件循环，使用 asyncio.run
+                            asyncio.run(self._push_position_update_async(message, position.user_id))
+                    except Exception as e:
+                        logger.warning(f"推送平仓 WebSocket 更新失败: {e}")
+                except Exception as e:
+                    logger.warning(f"推送平仓 WebSocket 更新失败: {e}")
         except Exception as e:
             logger.error(f"关闭持仓失败: {e}")
             self.db.rollback()
+    
+    async def _push_position_update_async(self, message: dict, user_id: int):
+        """异步推送持仓更新到 WebSocket"""
+        try:
+            from app.api.websocket import manager
+            # 发送给该用户的所有连接
+            for connection in manager.active_connections:
+                connection_user_id = manager.connection_users.get(connection)
+                if connection_user_id == user_id:
+                    try:
+                        await manager.send_personal_message(message, connection)
+                    except Exception as e:
+                        logger.debug(f"推送平仓更新失败: {e}")
+        except Exception as e:
+            logger.warning(f"推送 WebSocket 更新失败: {e}")
     
     def verify_and_close_positions(self, symbol: str, analysis_result: Dict):
         """
@@ -863,6 +921,16 @@ class TradingEngine:
             self.call_strategy_callback('after_loop', tradable_symbols)
             
         except Exception as e:
-            logger.error(f"交易循环执行失败: {e}")
+            # 详细记录交易循环异常信息
+            exception_type = type(e).__name__
+            exception_message = str(e)
+            user_strategy_id = self.user_strategy.id if self.user_strategy else '未知'
+            logger.error(
+                f"交易循环执行异常终止 - "
+                f"策略ID: {user_strategy_id}, "
+                f"异常类型: {exception_type}, "
+                f"异常消息: {exception_message}",
+                exc_info=True
+            )
             raise
 

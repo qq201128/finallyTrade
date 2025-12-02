@@ -9,15 +9,13 @@ from fastapi.exceptions import RequestValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 from app.core.database import engine, Base
 from app.core.config import settings
+from app.core.logging_config import setup_logging
 from app.api import auth, strategies, trades, websocket
 import logging
 import time
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# 配置日志（包括文件输出）
+setup_logging()
 logger = logging.getLogger(__name__)
 
 # 创建数据库表
@@ -109,9 +107,12 @@ async def startup_event():
     
     # 恢复所有启用的策略
     try:
-        from app.services.trading_scheduler import start_trading_scheduler
+        from app.services.trading_scheduler import start_trading_scheduler, start_thread_monitor
         logger.info("正在恢复所有启用的策略...")
         start_trading_scheduler()
+        
+        # 启动线程监控器，定期检查线程健康状态
+        start_thread_monitor()
     except Exception as e:
         logger.error(f"恢复策略失败: {e}", exc_info=True)
 
@@ -121,9 +122,10 @@ async def shutdown_event():
     """应用关闭事件"""
     logger.info("正在关闭应用...")
     
-    # 停止所有策略
+    # 停止所有策略和监控器
     try:
-        from app.services.trading_scheduler import stop_trading_scheduler
+        from app.services.trading_scheduler import stop_trading_scheduler, stop_thread_monitor
+        stop_thread_monitor()
         stop_trading_scheduler()
     except Exception as e:
         logger.error(f"停止策略失败: {e}", exc_info=True)

@@ -295,6 +295,50 @@ async def update_user_strategy(
     return user_strategy
 
 
+@router.get("/user/{user_strategy_id}/replenish-state")
+async def get_replenish_state(
+    user_strategy_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """获取双向策略的补仓状态（诊断用）"""
+    user_strategy = db.query(UserStrategy).filter(
+        UserStrategy.id == user_strategy_id,
+        UserStrategy.user_id == current_user.id
+    ).first()
+    
+    if not user_strategy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="策略不存在"
+        )
+    
+    # 获取补仓状态
+    config = user_strategy.config or {}
+    replenish_state = config.get('replenish_state', {
+        'long': {'wins': 0, 'last_trend': None, 'replenish_pool': []},
+        'short': {'wins': 0, 'last_trend': None, 'replenish_pool': []}
+    })
+    
+    return {
+        'user_strategy_id': user_strategy_id,
+        'position_adjustment_enabled': config.get('position_adjustment', False),
+        'replenish_state': replenish_state,
+        'long': {
+            'wins': replenish_state.get('long', {}).get('wins', 0),
+            'last_trend': replenish_state.get('long', {}).get('last_trend'),
+            'replenish_pool_count': len(replenish_state.get('long', {}).get('replenish_pool', [])),
+            'replenish_pool': replenish_state.get('long', {}).get('replenish_pool', [])
+        },
+        'short': {
+            'wins': replenish_state.get('short', {}).get('wins', 0),
+            'last_trend': replenish_state.get('short', {}).get('last_trend'),
+            'replenish_pool_count': len(replenish_state.get('short', {}).get('replenish_pool', [])),
+            'replenish_pool': replenish_state.get('short', {}).get('replenish_pool', [])
+        }
+    }
+
+
 @router.get("/user/{user_strategy_id}/history")
 async def get_strategy_history(
     user_strategy_id: int,

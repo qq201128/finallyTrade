@@ -323,6 +323,30 @@ class ExchangeService:
             logger.error(f"异步获取市场信息失败: {e}")
             raise
     
+    async def fetch_ticker_async(
+        self,
+        symbol: str,
+        use_cache: bool = True
+    ) -> Optional[Dict]:
+        """
+        异步获取指定交易对的完整 ticker 数据（支持缓存）
+        
+        Args:
+            symbol: 交易对，例如 'BTC/USDT:USDT'
+            use_cache: 是否启用缓存（注意：完整 ticker 数据通常不缓存，因为数据量大）
+        
+        Returns:
+            完整的 ticker 字典，包含 last, bid, ask, high, low, open, volume 等字段
+            获取失败时返回 None
+        """
+        try:
+            # 在线程池中执行同步调用
+            ticker = await self._to_thread(self.exchange.fetch_ticker, symbol)
+            return ticker
+        except Exception as e:
+            logger.error(f"获取 {symbol} ticker 数据失败: {e}")
+            return None
+    
     async def get_ticker_price_async(
         self,
         symbol: str,

@@ -461,22 +461,15 @@ export default {
         
         if (result.success) {
           ElMessage.success(result.data?.message || '平仓成功')
-          // 平仓后，WebSocket 会自动推送更新，无需手动刷新
-          // 但为了确保数据同步，可以延迟一小段时间后刷新（如果 WebSocket 未及时推送）
+          // closePosition action 已经会刷新持仓列表，这里只需要刷新再入场限制
+          // 添加一个小的延迟确保数据已同步
           setTimeout(async () => {
-            // 检查持仓是否还在列表中（WebSocket 可能已更新）
-            const stillExists = store.state.trades.positions.find(p => p.id === position.id && p.is_open)
-            if (stillExists) {
-              // 如果还在，说明 WebSocket 未及时更新，手动刷新
-              positionsLoading.value = true
-              try {
-                await store.dispatch('trades/fetchPositions')
-              } finally {
-                positionsLoading.value = false
-              }
+            try {
+              await fetchReentryBlocks()
+            } catch (error) {
+              console.error('刷新再入场限制失败:', error)
             }
-          }, 1000)
-          await fetchReentryBlocks()
+          }, 500)
         } else {
           ElMessage.error(result.error || '平仓失败')
         }
