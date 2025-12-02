@@ -1,77 +1,80 @@
 """
 WebSocket API - 实时数据推送
 """
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from typing import List, Dict, Any, Optional
-import json
 import logging
 import asyncio
+from sqlalchemy.orm import Session
+from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from app.core.database import SessionLocal
 from app.core.config import settings
 from app.models.trade import Position, Order
-from app.models.user import User
-from app.api.auth import get_current_user
 from app.services.monitoring import monitoring
+from app.utils.pnl import (
+    calculate_unrealized_pnl as _calc_unrealized_pnl,
+    calculate_margin_used as _calc_margin_used,
+    calculate_pnl_percentage as _calc_pnl_percentage
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _calculate_unrealized_pnl(position: Position, current_price: float) -> float:
-    """
-    统一的未实现盈亏计算（根据方向及绝对仓位）
-    """
-    if not current_price or not position.entry_price:
+def _calculate_unrealized_pnl(position, current_price: float) -> float:
+    """统一的未实现盈亏计算（包装函数，支持字典或对象）"""
+    if not current_price:
         return 0.0
-    
-    qty = abs(position.size or 0)
-    if qty == 0:
+    # 支持字典或对象
+    if isinstance(position, dict):
+        entry_price = position.get('entry_price')
+        size = position.get('size', 0)
+        side = position.get('side', 'long')
+    else:
+        entry_price = getattr(position, 'entry_price', None)
+        size = getattr(position, 'size', 0)
+        side = getattr(position, 'side', 'long')
+    if not entry_price:
         return 0.0
-    
-    if position.side == 'short':
-        return (position.entry_price - current_price) * qty
-    return (current_price - position.entry_price) * qty
+    return _calc_unrealized_pnl(entry_price, current_price, size, side)
 
 
-def _calculate_margin_used(position: Position) -> Optional[float]:
-    """计算持仓保证金（名义价值 / 杠杆）"""
-    entry_price = position.entry_price or 0
-    size = abs(position.size or 0)
-    leverage = position.leverage or 1
-    if leverage <= 0:
-        leverage = 1
-    if entry_price <= 0 or size <= 0:
-        return None
-    # 保证金 = 名义价值 / 杠杆
-    notional = entry_price * size
-    margin = notional / leverage
-    return margin
+def _calculate_margin_used(position) -> Optional[float]:
+    """计算持仓保证金（包装函数，支持字典或对象）"""
+    if isinstance(position, dict):
+        entry_price = position.get('entry_price', 0) or 0
+        size = position.get('size', 0) or 0
+        leverage = position.get('leverage', 1) or 1
+    else:
+        entry_price = getattr(position, 'entry_price', 0) or 0
+        size = getattr(position, 'size', 0) or 0
+        leverage = getattr(position, 'leverage', 1) or 1
+    return _calc_margin_used(entry_price, size, leverage)
 
 
-def _calculate_pnl_percentage(position: Position) -> Optional[float]:
-    """计算盈亏百分比（基于保证金）"""
-    entry_price = position.entry_price or 0
-    size = abs(position.size or 0)
-    unrealized = position.unrealized_pnl
-    leverage = position.leverage or 1
-    if leverage <= 0:
-        leverage = 1
-    if entry_price <= 0 or size <= 0:
-        return None
-    # 计算保证金
-    notional = entry_price * size
-    margin_used = notional / leverage
-    # 盈亏百分比 = (未实现盈亏 / 保证金) * 100
-    if margin_used > 0 and unrealized is not None:
-        return (unrealized / margin_used) * 100
-    return None
+def _calculate_pnl_percentage(position) -> Optional[float]:
+    """计算盈亏百分比（包装函数，支持字典或对象）"""
+    if isinstance(position, dict):
+        entry_price = position.get('entry_price', 0) or 0
+        size = position.get('size', 0) or 0
+        unrealized_pnl = position.get('unrealized_pnl')
+        leverage = position.get('leverage', 1) or 1
+    else:
+        entry_price = getattr(position, 'entry_price', 0) or 0
+        size = getattr(position, 'size', 0) or 0
+        unrealized_pnl = getattr(position, 'unrealized_pnl', None)
+        leverage = getattr(position, 'leverage', 1) or 1
+    return _calc_pnl_percentage(entry_price, size, unrealized_pnl, leverage)
+
 
 router = APIRouter(prefix="/api/ws", tags=["websocket"])
 
 
 class ConnectionManager:
     """WebSocket连接管理器"""
-    
+
+    # 价格缓存过期时间（秒）
+    PRICE_CACHE_EXPIRY = 300  # 5分钟
+
     def __init__(self):
         self.active_connections: List[WebSocket] = []
         # 连接和用户ID的映射 {websocket: user_id}
@@ -88,13 +91,62 @@ class ConnectionManager:
         self._price_update_queue: Dict[str, tuple] = {}
         # 批量更新任务
         self._batch_update_task: Optional[asyncio.Task] = None
+        # 缓存清理任务
+        self._cleanup_task: Optional[asyncio.Task] = None
         # 持仓缓存：{symbol: [position_info]} - 缓存持仓信息，减少数据库查询
         self._positions_cache: Dict[str, List[Dict]] = {}
         # 持仓缓存更新时间戳
         self._positions_cache_timestamp: float = 0
-        # 持仓缓存有效期（秒）
-        self._positions_cache_ttl: float = 10.0
-        # 批量更新任务将在有事件循环时启动（延迟初始化）
+        # 持仓缓存有效期（秒）- 使用配置
+        self._positions_cache_ttl: float = settings.WS_POSITIONS_CACHE_TTL
+
+    async def cleanup_stale_caches(self):
+        """清理过期的缓存和订阅"""
+        import time
+        current_time = time.time()
+
+        # 清理无引用的订阅
+        for symbol in list(self.subscription_refs.keys()):
+            if self.subscription_refs.get(symbol, 0) <= 0:
+                self.release_ticker_subscription(symbol)
+
+        # 清理过期的价格缓存
+        for symbol in list(self.global_price_cache.keys()):
+            cache_data = self.global_price_cache.get(symbol, {})
+            cache_timestamp = cache_data.get('timestamp', 0)
+            # 如果时间戳是毫秒，转换为秒
+            if cache_timestamp > 1e12:
+                cache_timestamp = cache_timestamp / 1000
+            if current_time - cache_timestamp > self.PRICE_CACHE_EXPIRY:
+                del self.global_price_cache[symbol]
+                logger.debug(f"清理过期价格缓存: {symbol}")
+
+        # 清理过期的持仓缓存
+        if current_time - self._positions_cache_timestamp > self._positions_cache_ttl * 10:
+            self._positions_cache.clear()
+            logger.debug("清理过期持仓缓存")
+
+    async def _cleanup_worker(self):
+        """定期清理缓存的工作任务"""
+        while True:
+            try:
+                await asyncio.sleep(60)  # 每分钟清理一次
+                await self.cleanup_stale_caches()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"缓存清理任务错误: {e}")
+                await asyncio.sleep(60)
+
+    def _ensure_cleanup_task(self):
+        """确保清理任务已启动"""
+        if self._cleanup_task is None or self._cleanup_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+                self._cleanup_task = loop.create_task(self._cleanup_worker())
+                logger.debug("缓存清理任务已启动")
+            except RuntimeError:
+                pass
     
     async def connect(self, websocket: WebSocket, user_id: int = None):
         """接受WebSocket连接"""
@@ -102,6 +154,8 @@ class ConnectionManager:
         self.active_connections.append(websocket)
         if user_id:
             self.connection_users[websocket] = user_id
+        # 确保清理任务已启动
+        self._ensure_cleanup_task()
         logger.info(f"WebSocket连接已建立，当前连接数: {len(self.active_connections)}")
     
     def disconnect(self, websocket: WebSocket):
@@ -390,13 +444,12 @@ class ConnectionManager:
     
     async def _batch_update_worker(self):
         """批量更新数据库的工作线程（降低数据库更新频率，避免连接池溢出）"""
-        import asyncio
         from app.models.trade import Position
         from app.core.database import get_db_context
-        
-        # 每5秒批量更新一次数据库（而不是每次价格变化都更新）
-        BATCH_UPDATE_INTERVAL = 5.0  # 5秒
-        MAX_BATCH_SIZE = 50  # 每次最多更新50个持仓
+
+        # 使用配置常量
+        BATCH_UPDATE_INTERVAL = settings.WS_BATCH_UPDATE_INTERVAL
+        MAX_BATCH_SIZE = settings.WS_MAX_BATCH_SIZE
         
         while True:
             try:
@@ -477,67 +530,93 @@ async def websocket_positions(websocket: WebSocket, user_id: int):
         subscribed_symbols = set()
         
         # 初始化：获取所有持仓并启动订阅
-        positions = db.query(Position).filter(
+        # 将 ORM 对象转换为字典，避免 Session 过期后的 DetachedInstanceError
+        positions_query = db.query(Position).filter(
             Position.user_id == user_id,
             Position.is_open == True
         ).all()
-        
+
+        # 立即提取所有需要的属性，存储为字典列表
+        positions = []
+        for p in positions_query:
+            positions.append({
+                'id': p.id,
+                'symbol': p.symbol,
+                'side': p.side,
+                'size': p.size,
+                'entry_price': p.entry_price,
+                'current_price': p.current_price,
+                'unrealized_pnl': p.unrealized_pnl,
+                'leverage': p.leverage,
+                'user_strategy_id': p.user_strategy_id
+            })
+
         user_strategies = db.query(UserStrategy).filter(
             UserStrategy.user_id == user_id,
             UserStrategy.is_enabled == True
         ).all()
+
+        # 同样将策略转换为字典
+        strategies_dict = {}
+        for us in user_strategies:
+            strategies_dict[us.id] = {
+                'id': us.id,
+                'exchange': us.exchange,
+                'api_key': us.api_key,
+                'api_secret': us.api_secret
+            }
         
         # 为每个持仓启动或复用全局价格订阅
         for position in positions:
-            user_strategy = next((us for us in user_strategies if us.id == position.user_strategy_id), None)
+            user_strategy = strategies_dict.get(position['user_strategy_id'])
             if not user_strategy:
                 continue
-            
+
             # 创建或获取 ExchangeService 实例（全局缓存）
             strategy_info = {
-                'exchange': user_strategy.exchange,
-                'api_key': user_strategy.api_key,
-                'api_secret': user_strategy.api_secret
+                'exchange': user_strategy['exchange'],
+                'api_key': user_strategy['api_key'],
+                'api_secret': user_strategy['api_secret']
             }
-            cache_key = f"{user_strategy.exchange}_{user_strategy.api_key}"
+            cache_key = f"{user_strategy['exchange']}_{user_strategy['api_key']}"
             if cache_key not in manager.global_exchange_services:
                 manager.global_exchange_services[cache_key] = ExchangeService(
-                    exchange_name=user_strategy.exchange,
-                    api_key=user_strategy.api_key,
-                    api_secret=user_strategy.api_secret
+                    exchange_name=user_strategy['exchange'],
+                    api_key=user_strategy['api_key'],
+                    api_secret=user_strategy['api_secret']
                 )
-            
+
             exchange_service = manager.global_exchange_services[cache_key]
-            
+
             # 获取或创建全局价格订阅（如果已存在则复用，不传入db）
-            if manager.get_or_create_ticker_subscription(position.symbol, exchange_service, strategy_info):
-                subscribed_symbols.add(position.symbol)
+            if manager.get_or_create_ticker_subscription(position['symbol'], exchange_service, strategy_info):
+                subscribed_symbols.add(position['symbol'])
         
         # 发送初始持仓数据（使用数据库中的价格或全局缓存）
         initial_position_data = []
         for position in positions:
             # 优先使用全局价格缓存
-            current_price = position.current_price or 0
-            if position.symbol in manager.global_price_cache:
-                cached_price = manager.global_price_cache[position.symbol].get('last', 0)
+            current_price = position['current_price'] or 0
+            if position['symbol'] in manager.global_price_cache:
+                cached_price = manager.global_price_cache[position['symbol']].get('last', 0)
                 if cached_price > 0:
                     current_price = cached_price
-            
-            if position.entry_price and current_price:
-                position.unrealized_pnl = _calculate_unrealized_pnl(position, current_price)
-            
+
+            if position['entry_price'] and current_price:
+                position['unrealized_pnl'] = _calculate_unrealized_pnl(position, current_price)
+
             margin_used = _calculate_margin_used(position)
             pnl_percentage = _calculate_pnl_percentage(position)
-            
+
             initial_position_data.append({
-                "id": position.id,
-                "symbol": position.symbol,
-                "side": position.side,
-                "size": position.size,
-                "entry_price": position.entry_price,
+                "id": position['id'],
+                "symbol": position['symbol'],
+                "side": position['side'],
+                "size": position['size'],
+                "entry_price": position['entry_price'],
                 "current_price": current_price,
-                "unrealized_pnl": position.unrealized_pnl,
-                "leverage": position.leverage or 1,
+                "unrealized_pnl": position['unrealized_pnl'],
+                "leverage": position['leverage'] or 1,
                 "margin_used": margin_used,
                 "pnl_percentage": pnl_percentage
             })
@@ -555,42 +634,45 @@ async def websocket_positions(websocket: WebSocket, user_id: int):
                 if symbol in manager.global_price_cache:
                     price_info = manager.global_price_cache[symbol]
                     current_price = price_info.get('last', 0)
-                    
+
                     if current_price > 0:
                         # 查找该用户该交易对的持仓
-                        user_positions = [p for p in positions if p.symbol == symbol]
+                        user_positions = [p for p in positions if p['symbol'] == symbol]
                         if user_positions:
                             position_data = []
                             for position in user_positions:
                                 # 使用最新价格重新计算未实现盈亏，保持与后端一致
-                                if position.entry_price and current_price:
-                                    position.unrealized_pnl = _calculate_unrealized_pnl(position, current_price)
-                                
+                                if position['entry_price'] and current_price:
+                                    position['unrealized_pnl'] = _calculate_unrealized_pnl(position, current_price)
+
                                 margin_used = _calculate_margin_used(position)
                                 pnl_percentage = _calculate_pnl_percentage(position)
-                                
+
                                 position_data.append({
-                                    "id": position.id,
-                                    "symbol": position.symbol,
-                                    "side": position.side,
-                                    "size": position.size,
-                                    "entry_price": position.entry_price,
+                                    "id": position['id'],
+                                    "symbol": position['symbol'],
+                                    "side": position['side'],
+                                    "size": position['size'],
+                                    "entry_price": position['entry_price'],
                                     "current_price": current_price,
-                                    "unrealized_pnl": position.unrealized_pnl,
-                                    "leverage": position.leverage or 1,
+                                    "unrealized_pnl": position['unrealized_pnl'],
+                                    "leverage": position['leverage'] or 1,
                                     "margin_used": margin_used,
                                     "pnl_percentage": pnl_percentage
                                 })
-                            
+
                             await manager.send_personal_message({
                                 "type": "positions",
                                 "data": position_data
                             }, websocket)
-            
+
             await asyncio.sleep(0.5)  # 每0.5秒检查一次价格更新
-            
+
     except WebSocketDisconnect:
         logger.info(f"WebSocket连接断开: 用户 {user_id}")
+    except (ConnectionClosedOK, ConnectionClosedError) as e:
+        # 客户端正常关闭连接（如刷新页面），不需要打印错误
+        logger.info(f"WebSocket连接已关闭: 用户 {user_id}, 原因: {e.code}")
     except Exception as e:
         logger.error(f"WebSocket错误: {e}", exc_info=True)
     finally:

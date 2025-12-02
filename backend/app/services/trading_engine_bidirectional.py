@@ -9,114 +9,45 @@
 - 正确的止损止盈判断（根据持仓方向）
 - 支持策略返回long/short信号
 """
-import asyncio
 import logging
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
+from datetime import datetime
 from sqlalchemy.orm import Session
 from app.models import Position, Order, UserStrategy, PnLRecord
 from app.models.trade import OrderStatus, OrderSide, OrderType
 from app.services.exchange_service import ExchangeService
 from app.services.strategy_engine import StrategyEngine
-from app.services.ohlcv_cache import get_ohlcv_cache
+from app.services.base_trading_engine import BaseTradingEngine
+from app.services.ohlcv_cache import fetch_ohlcv_batch_sync
 from app.core.config import settings
+from app.utils.timeframe import parse_timeframe, get_candle_start_timestamp
+from app.utils.pnl import calculate_unrealized_pnl
+from app.utils.websocket_push import push_position_update_sync
 import pandas as pd
-import re
 
 logger = logging.getLogger(__name__)
 
 
-class BidirectionalTradingEngine:
+class BidirectionalTradingEngine(BaseTradingEngine):
     """双向交易执行引擎 - 支持双向持仓、双向补仓、双向平仓"""
-    
-    def __init__(self, db: Session, user_strategy: UserStrategy, 
+
+    def __init__(self, db: Session, user_strategy: UserStrategy,
                  exchange_service: ExchangeService, strategy_engine: StrategyEngine):
         """
         初始化双向交易引擎
-        
+
         Args:
             db: 数据库会话
             user_strategy: 用户策略配置
             exchange_service: 交易所服务
             strategy_engine: 策略引擎
         """
-        self.db = db
-        self.user_strategy = user_strategy
-        self.exchange_service = exchange_service
-        self.strategy_engine = strategy_engine
-        self.strategy_module = None
-        # 使用全局共享的OHLCV缓存
-        self.ohlcv_cache = get_ohlcv_cache(ttl_seconds=settings.CACHE_OHLCV_TTL)
-        
-        # 加载策略
-        self._load_strategy()
-    
-    @staticmethod
-    def _parse_timeframe(timeframe: str) -> int:
-        """解析时间周期字符串，返回秒数"""
-        match = re.match(r'(\d+)([smhd])', timeframe.lower())
-        if not match:
-            return 3600
-        
-        value = int(match.group(1))
-        unit = match.group(2)
-        
-        if unit == 's':
-            return value
-        elif unit == 'm':
-            return value * 60
-        elif unit == 'h':
-            return value * 3600
-        elif unit == 'd':
-            return value * 86400
-        else:
-            return 3600
-    
-    def _get_candle_start_timestamp(self, timestamp: datetime, timeframe: str) -> datetime:
-        """获取K线周期的开始时间戳"""
-        seconds = self._parse_timeframe(timeframe)
-        unix_timestamp = int(timestamp.timestamp())
-        candle_start = unix_timestamp // seconds * seconds
-        return datetime.fromtimestamp(candle_start)
-    
-    def _get_last_close_candle_timestamp(self, symbol: str, side: str) -> Optional[datetime]:
-        """获取指定交易对和方向最后平仓的K线周期时间戳"""
-        if not self.user_strategy.config:
-            return None
-        
-        last_close_times = self.user_strategy.config.get('last_close_candle_times', {})
-        key = f"{symbol}_{side}"
-        timestamp_str = last_close_times.get(key)
-        if timestamp_str:
-            try:
-                return datetime.fromisoformat(timestamp_str)
-            except (ValueError, TypeError):
-                return None
-        return None
-    
-    def _set_last_close_candle_timestamp(self, symbol: str, side: str, timestamp: datetime):
-        """设置指定交易对和方向最后平仓的K线周期时间戳"""
-        if not self.user_strategy.config:
-            self.user_strategy.config = {}
-        
-        if 'last_close_candle_times' not in self.user_strategy.config:
-            self.user_strategy.config['last_close_candle_times'] = {}
-        
-        key = f"{symbol}_{side}"
-        self.user_strategy.config['last_close_candle_times'][key] = timestamp.isoformat()
-        self.db.commit()
-    
-    def _load_strategy(self):
-        """加载策略模块"""
-        try:
-            self.strategy_module = self.strategy_engine.load_strategy(
-                self.user_strategy.strategy.name,
-                self.user_strategy.strategy.file_path
-            )
-        except Exception as e:
-            logger.error(f"加载策略失败: {e}")
-            raise
-    
+        super().__init__(db, user_strategy, exchange_service, strategy_engine)
+
+    # 注意：_get_candle_start_timestamp, _get_last_close_candle_timestamp,
+    # _set_last_close_candle_timestamp 方法已移到基类 BaseTradingEngine
+    # 基类方法支持 side 参数，可直接用于双向交易
+
     def get_open_positions(self, symbol: Optional[str] = None, side: Optional[str] = None) -> List[Position]:
         """
         获取未平仓交易（支持按交易对和方向筛选）
@@ -143,63 +74,7 @@ class BidirectionalTradingEngine:
         positions = query.all()
         logger.debug(f"查询持仓: symbol={symbol}, side={side}, 找到 {len(positions)} 个持仓")
         return positions
-    
-    def get_tradable_symbols(self) -> List[str]:
-        """获取可交易的交易对列表"""
-        try:
-            symbols = self.exchange_service.get_tradable_symbols()
-            if self.user_strategy.symbols and len(self.user_strategy.symbols) > 0:
-                allowed_symbols = self.user_strategy.symbols
-                symbols = [s for s in symbols if s in allowed_symbols]
-                logger.info(f"使用配置的币种列表: {allowed_symbols}, 过滤后: {len(symbols)} 个交易对")
-            return symbols
-        except Exception as e:
-            logger.error(f"获取可交易对列表失败: {e}")
-            return []
-    
-    def fetch_ohlcv_data(self, symbol: str, timeframe: str = None, 
-                        limit: int = 100) -> Optional[pd.DataFrame]:
-        """
-        获取OHLCV数据（使用全局共享缓存）
-        多个策略可以共享相同交易对的K线数据
-        """
-        if timeframe is None:
-            timeframe = self.user_strategy.timeframe if self.user_strategy.timeframe else '1h'
-        
-        # 从全局共享缓存获取
-        exchange_name = self.exchange_service.exchange_name
-        cached_df = self.ohlcv_cache.get(exchange_name, symbol, timeframe)
-        if cached_df is not None:
-            logger.debug(f"从共享缓存获取OHLCV数据: {exchange_name}:{symbol}:{timeframe}")
-            return cached_df
-        
-        # 缓存未命中，从交易所获取
-        try:
-            logger.debug(f"从交易所获取OHLCV数据: {exchange_name}:{symbol}:{timeframe}")
-            ohlcv = self.exchange_service.fetch_ohlcv(symbol, timeframe, limit=limit)
-            if not ohlcv:
-                return None
-            
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            
-            # 存储到全局共享缓存
-            self.ohlcv_cache.set(exchange_name, symbol, timeframe, df)
-            
-            return df
-        except Exception as e:
-            logger.error(f"获取 {symbol} OHLCV数据失败: {e}")
-            return None
-    
-    def call_strategy_callback(self, callback_name: str, *args, **kwargs):
-        """调用策略回调函数"""
-        if self.strategy_module:
-            return self.strategy_engine.call_strategy_callback(
-                self.strategy_module, callback_name, *args, **kwargs
-            )
-        return None
-    
+
     def analyze_strategy(self, symbol: str, dataframe: pd.DataFrame) -> Dict[str, Any]:
         """
         分析策略信号（支持long/short信号）
@@ -317,21 +192,10 @@ class BidirectionalTradingEngine:
         }
     
     def calculate_unrealized_pnl(self, position: Position, current_price: float) -> float:
-        """
-        计算未实现盈亏（根据持仓方向）
-        
-        Args:
-            position: 持仓对象
-            current_price: 当前价格
-        
-        Returns:
-            未实现盈亏（正数表示盈利，负数表示亏损）
-        """
-        position_size = abs(position.size or 0)
-        if position.side == 'long':
-            return (current_price - position.entry_price) * position_size
-        else:
-            return (position.entry_price - current_price) * position_size
+        """计算未实现盈亏（根据持仓方向）"""
+        return calculate_unrealized_pnl(
+            position.entry_price, current_price, position.size, position.side
+        )
     
     def check_stop_loss_take_profit(self, position: Position, current_price: float) -> tuple[bool, Optional[str], Optional[float]]:
         """
@@ -367,11 +231,13 @@ class BidirectionalTradingEngine:
         
         for position in positions:
             try:
-                # 获取当前价格
-                ticker = self.exchange_service.exchange.fetch_ticker(symbol)
-                current_price = ticker['last']
+                # 获取当前价格（使用缓存避免重复 API 调用）
+                current_price = self._get_cached_price(symbol)
+                if not current_price:
+                    logger.warning(f"无法获取 {symbol} 价格，跳过持仓检查")
+                    continue
                 position.current_price = current_price
-                
+
                 # 计算未实现盈亏（根据持仓方向）
                 position.unrealized_pnl = self.calculate_unrealized_pnl(position, current_price)
                 
@@ -396,7 +262,7 @@ class BidirectionalTradingEngine:
                 disable_engine_stop_loss = self.user_strategy.config.get('disable_engine_stop_loss', is_bidirectional)
                 
                 if not disable_engine_stop_loss:
-                    roi_threshold = self.user_strategy.config.get('stop_loss_roi', -0.5)  # 默认-50%（基于保证金）
+                    roi_threshold = self.user_strategy.config.get('stop_loss_roi', settings.DEFAULT_ROI_THRESHOLD)  # 基于保证金
                     if position.entry_price > 0:
                         # 计算保证金（考虑杠杆）
                         leverage = position.leverage or 1
@@ -587,7 +453,7 @@ class BidirectionalTradingEngine:
                 
                 timeframe = self.user_strategy.timeframe if self.user_strategy.timeframe else '1h'
                 close_candle_timestamp = self._get_candle_start_timestamp(datetime.now(), timeframe)
-                self._set_last_close_candle_timestamp(position.symbol, position.side, close_candle_timestamp)
+                self._set_last_close_candle_timestamp(position.symbol, close_candle_timestamp, position.side)
                 logger.info(f"记录平仓K线周期: {position.symbol}, 方向: {position.side}, 周期: {close_candle_timestamp}")
             
             # 创建盈亏记录
@@ -629,63 +495,11 @@ class BidirectionalTradingEngine:
             
             # 如果持仓已完全关闭，推送 WebSocket 更新通知前端
             if position_was_closed:
-                try:
-                    import asyncio
-                    from app.api.websocket import manager
-                    
-                    # 创建异步任务推送 WebSocket 更新
-                    position_data = {
-                        "id": position.id,
-                        "symbol": position.symbol,
-                        "side": position.side,
-                        "size": 0,
-                        "entry_price": position.entry_price,
-                        "current_price": exit_price,
-                        "unrealized_pnl": 0,
-                        "leverage": position.leverage or 1,
-                        "margin_used": 0,
-                        "pnl_percentage": 0,
-                        "is_open": False
-                    }
-                    message = {
-                        "type": "positions",
-                        "data": [position_data]
-                    }
-                    
-                    # 在后台线程中运行异步推送（交易引擎在独立线程中运行）
-                    # 使用 asyncio.run 在 Python 3.7+ 中安全运行
-                    try:
-                        # 尝试获取当前事件循环
-                        try:
-                            loop = asyncio.get_running_loop()
-                            # 如果有运行中的事件循环，使用 create_task
-                            asyncio.create_task(self._push_position_update_async(message, position.user_id))
-                        except RuntimeError:
-                            # 没有运行中的事件循环，使用 asyncio.run
-                            asyncio.run(self._push_position_update_async(message, position.user_id))
-                    except Exception as e:
-                        logger.warning(f"推送平仓 WebSocket 更新失败: {e}")
-                except Exception as e:
-                    logger.warning(f"推送平仓 WebSocket 更新失败: {e}")
+                push_position_update_sync(position, exit_price, is_closed=True)
         except Exception as e:
             logger.error(f"关闭持仓失败: {e}")
             self.db.rollback()
-    
-    async def _push_position_update_async(self, message: dict, user_id: int):
-        """异步推送持仓更新到 WebSocket"""
-        try:
-            from app.api.websocket import manager
-            # 发送给该用户的所有连接
-            for connection in manager.active_connections:
-                connection_user_id = manager.connection_users.get(connection)
-                if connection_user_id == user_id:
-                    try:
-                        await manager.send_personal_message(message, connection)
-                    except Exception as e:
-                        logger.debug(f"推送平仓更新失败: {e}")
-        except Exception as e:
-            logger.warning(f"推送 WebSocket 更新失败: {e}")
-    
+
     def adjust_position_size(self, position: Position):
         """
         仓位调整（支持双向补仓）
@@ -803,7 +617,7 @@ class BidirectionalTradingEngine:
             return
         
         timeframe = self.user_strategy.timeframe if self.user_strategy.timeframe else '1h'
-        last_close_candle = self._get_last_close_candle_timestamp(symbol, entry_side)
+        last_close_candle = self._get_last_close_candle_timestamp(symbol, side=entry_side)
         if last_close_candle:
             current_candle = self._get_candle_start_timestamp(datetime.now(), timeframe)
             if current_candle == last_close_candle:
@@ -825,29 +639,30 @@ class BidirectionalTradingEngine:
             logger.warning(f"双重检查发现已有{entry_side}持仓: {symbol}, 持仓ID: {existing_position[0].id}, 跳过开仓（可能是并发导致）")
             return
         
-        desired_leverage = self.user_strategy.config.get('leverage', 50) or 50
-        
+        desired_leverage = self.user_strategy.config.get('leverage', settings.DEFAULT_LEVERAGE) or settings.DEFAULT_LEVERAGE
+
         try:
             # 获取保证金（从用户配置中，trade_amount 现在代表保证金）
             try:
-                margin_amount = float(self.user_strategy.trade_amount) if self.user_strategy.trade_amount else 0.001
+                margin_amount = float(self.user_strategy.trade_amount) if self.user_strategy.trade_amount else settings.DEFAULT_MARGIN_AMOUNT
             except (ValueError, TypeError):
-                margin_amount = 0.001
-                logger.warning(f"无法解析交易数量配置，使用默认值 0.001 USDT")
+                margin_amount = settings.DEFAULT_MARGIN_AMOUNT
+                logger.warning(f"无法解析交易数量配置，使用默认值 {settings.DEFAULT_MARGIN_AMOUNT} USDT")
             
             # 计算名义价值：名义价值 = 保证金 × 杠杆
             notional_value = margin_amount * desired_leverage
             
-            try:
-                ticker = self.exchange_service.exchange.fetch_ticker(symbol)
-                current_price = ticker.get('last', 0)
-                if current_price == 0:
+            # 获取当前市场价格（使用缓存避免重复 API 调用）
+            current_price = self._get_cached_price(symbol)
+            if not current_price:
+                # 如果获取不到价格，尝试从OHLCV数据获取
+                try:
                     ohlcv = self.exchange_service.fetch_ohlcv(symbol, self.user_strategy.timeframe, limit=1)
                     if ohlcv and len(ohlcv) > 0:
                         current_price = ohlcv[-1][4]
-            except Exception as e:
-                logger.warning(f"获取 {symbol} 价格失败: {e}")
-                current_price = 0
+                        self._price_cache[symbol] = current_price
+                except Exception as e:
+                    logger.warning(f"获取 {symbol} OHLCV 价格失败: {e}")
             
             if current_price <= 0:
                 logger.error(f"无法获取 {symbol} 的价格，跳过开仓")
@@ -1005,46 +820,16 @@ class BidirectionalTradingEngine:
         except Exception as e:
             logger.error(f"创建持仓失败: {e}", exc_info=True)
             self.db.rollback()
-    
-    def update_order_status(self):
-        """更新订单状态"""
-        try:
-            pending_orders = self.db.query(Order).filter(
-                Order.user_id == self.user_strategy.user_id,
-                Order.status.in_([OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED])
-            ).all()
-            
-            for order in pending_orders:
-                try:
-                    exchange_order = self.exchange_service.fetch_order(
-                        order.exchange_order_id, order.symbol
-                    )
-                    
-                    order.status = OrderStatus(exchange_order.get('status', 'pending'))
-                    order.filled = exchange_order.get('filled', 0.0)
-                    order.cost = exchange_order.get('cost', 0.0)
-                    order.fee = exchange_order.get('fee', {}).get('cost', 0.0)
-                    
-                    if order.status == OrderStatus.FILLED:
-                        order.filled_at = datetime.now()
-                        self.order_filled(order, exchange_order)
-                    
-                    self.db.commit()
-                except Exception as e:
-                    logger.error(f"更新订单 {order.id} 状态失败: {e}")
-                    continue
-        except Exception as e:
-            logger.error(f"更新订单状态失败: {e}")
-    
+
     def update_positions_prices(self):
         """更新所有持仓的当前价格和盈亏"""
         try:
             positions = self.get_open_positions()
             for position in positions:
                 try:
-                    ticker = self.exchange_service.exchange.fetch_ticker(position.symbol)
-                    current_price = ticker.get('last', 0)
-                    if current_price > 0:
+                    # 获取当前价格（使用缓存避免重复 API 调用）
+                    current_price = self._get_cached_price(position.symbol)
+                    if current_price and current_price > 0:
                         position.current_price = current_price
                         position.unrealized_pnl = self.calculate_unrealized_pnl(position, current_price)
                         self.db.commit()
@@ -1053,11 +838,12 @@ class BidirectionalTradingEngine:
                     continue
         except Exception as e:
             logger.error(f"更新持仓价格失败: {e}")
-    
+
     def run_trading_loop(self):
         """执行交易循环（支持双向交易）"""
-        # logger.info(f"开始双向交易循环: 用户策略 {self.user_strategy.id}")
-        
+        # 清空价格缓存，确保每次循环获取最新价格
+        self._clear_price_cache()
+
         try:
             open_positions = self.get_open_positions()
             # logger.info(f"当前未平仓交易数: {len(open_positions)} (多头: {len([p for p in open_positions if p.side == 'long'])}, "
@@ -1067,48 +853,58 @@ class BidirectionalTradingEngine:
             
             tradable_symbols = self.get_tradable_symbols()
             # logger.info(f"可交易对数量: {len(tradable_symbols)}")
-            
+
             self.call_strategy_callback('before_loop', tradable_symbols)
-            
+
+            # 批量并行获取所有交易对的 OHLCV 数据
+            timeframe = self.get_timeframe()
+            ohlcv_data = fetch_ohlcv_batch_sync(
+                self.exchange_service,
+                tradable_symbols,
+                timeframe,
+                limit=settings.DEFAULT_OHLCV_LIMIT,
+                max_workers=5
+            )
+
+            # 更新订单状态（移到循环外，只需执行一次）
+            self.update_order_status()
+
+            # 循环开始前一次性获取所有持仓，按 symbol 分组（优化：减少数据库查询）
+            all_positions = self.get_open_positions()
+            positions_by_symbol: Dict[str, List[Position]] = {}
+            for pos in all_positions:
+                if pos.symbol not in positions_by_symbol:
+                    positions_by_symbol[pos.symbol] = []
+                positions_by_symbol[pos.symbol].append(pos)
+
             for symbol in tradable_symbols:
                 try:
-                    dataframe = self.fetch_ohlcv_data(symbol)
+                    # 从批量获取的结果中取数据
+                    dataframe = ohlcv_data.get(symbol)
                     if dataframe is None or dataframe.empty:
                         continue
-                    
+
                     analysis_result = self.analyze_strategy(symbol, dataframe)
-                    
-                    self.update_order_status()
-                    
+
                     self.verify_and_close_positions(symbol, analysis_result)
-                    
-                    # 重新获取 open_positions，因为可能在 verify_and_close_positions 中被关闭
-                    # 同时过滤出当前 symbol 的持仓
-                    current_positions = []
-                    try:
-                        all_open_positions = self.get_open_positions()
-                        for pos in all_open_positions:
-                            try:
-                                # 检查 position 是否仍然有效
-                                if pos.symbol == symbol and pos.is_open:
-                                    current_positions.append(pos)
-                            except Exception as e:
-                                # Position 对象已过期或已被删除，跳过
-                                logger.debug(f"跳过已失效的持仓对象: {e}")
-                                continue
-                    except Exception as e:
-                        logger.warning(f"获取持仓列表失败: {e}")
-                    
-                    # 对当前 symbol 的持仓进行仓位调整（统一在这里处理，避免重复调用）
+
+                    # 从预先获取的持仓映射中获取当前 symbol 的持仓
+                    # 注意：verify_and_close_positions 可能已关闭某些持仓，需要过滤
+                    current_positions = [
+                        pos for pos in positions_by_symbol.get(symbol, [])
+                        if pos.is_open
+                    ]
+
+                    # 对当前 symbol 的持仓进行仓位调整
                     for position in current_positions:
                         try:
                             self.adjust_position_size(position)
                         except Exception as e:
                             logger.error(f"调整持仓 {position.id if position else 'N/A'} 失败: {e}")
                             continue
-                    
+
                     self.verify_and_open_positions(symbol, analysis_result)
-                    
+
                 except Exception as e:
                     logger.error(f"处理交易对 {symbol} 失败: {e}")
                     continue

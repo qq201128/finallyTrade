@@ -213,19 +213,176 @@ _cache_lock = threading.Lock()
 def get_ohlcv_cache(ttl_seconds: int = 300) -> OHLCVCache:
     """
     获取全局OHLCV缓存实例（单例模式）
-    
+
     Args:
         ttl_seconds: 默认缓存有效期（秒），仅在首次创建时生效
-        
+
     Returns:
         OHLCVCache实例
     """
     global _ohlcv_cache_instance
-    
+
     if _ohlcv_cache_instance is None:
         with _cache_lock:
             if _ohlcv_cache_instance is None:
                 _ohlcv_cache_instance = OHLCVCache(default_ttl_seconds=ttl_seconds)
-    
+
     return _ohlcv_cache_instance
+
+
+async def fetch_ohlcv_batch_async(
+    exchange_service,
+    symbols: list,
+    timeframe: str,
+    limit: int = 100,
+    max_concurrent: int = 5
+) -> Dict[str, Optional[pd.DataFrame]]:
+    """
+    并行批量获取多个交易对的 OHLCV 数据
+
+    Args:
+        exchange_service: ExchangeService 实例
+        symbols: 交易对列表
+        timeframe: 时间周期
+        limit: 每个交易对获取的K线数量
+        max_concurrent: 最大并发数（避免触发交易所限流）
+
+    Returns:
+        {symbol: DataFrame} 字典，获取失败的为 None
+    """
+    import asyncio
+
+    cache = get_ohlcv_cache()
+    exchange_name = exchange_service.exchange_name
+    results: Dict[str, Optional[pd.DataFrame]] = {}
+
+    # 分离缓存命中和需要获取的交易对
+    symbols_to_fetch = []
+    for symbol in symbols:
+        cached_df = cache.get(exchange_name, symbol, timeframe)
+        if cached_df is not None:
+            results[symbol] = cached_df
+            logger.debug(f"OHLCV 缓存命中: {symbol}")
+        else:
+            symbols_to_fetch.append(symbol)
+
+    if not symbols_to_fetch:
+        logger.debug(f"所有 {len(symbols)} 个交易对都命中缓存")
+        return results
+
+    logger.info(f"并行获取 {len(symbols_to_fetch)} 个交易对的 OHLCV 数据（缓存命中 {len(results)} 个）")
+
+    # 使用信号量限制并发数
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def fetch_single(symbol: str) -> tuple:
+        """获取单个交易对的数据"""
+        async with semaphore:
+            try:
+                ohlcv = await exchange_service.fetch_ohlcv_async(symbol, timeframe, limit=limit)
+                if not ohlcv:
+                    return symbol, None
+
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+
+                # 存入缓存
+                cache.set(exchange_name, symbol, timeframe, df)
+
+                return symbol, df
+            except Exception as e:
+                logger.warning(f"获取 {symbol} OHLCV 数据失败: {e}")
+                return symbol, None
+
+    # 并行执行所有请求
+    tasks = [fetch_single(symbol) for symbol in symbols_to_fetch]
+    fetch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 处理结果
+    for result in fetch_results:
+        if isinstance(result, Exception):
+            logger.error(f"OHLCV 获取异常: {result}")
+            continue
+        if isinstance(result, tuple):
+            symbol, df = result
+            results[symbol] = df
+
+    logger.info(f"OHLCV 批量获取完成: 成功 {sum(1 for v in results.values() if v is not None)}/{len(symbols)}")
+    return results
+
+
+def fetch_ohlcv_batch_sync(
+    exchange_service,
+    symbols: list,
+    timeframe: str,
+    limit: int = 100,
+    max_workers: int = 5
+) -> Dict[str, Optional[pd.DataFrame]]:
+    """
+    同步版本的批量获取 OHLCV 数据（使用线程池）
+
+    Args:
+        exchange_service: ExchangeService 实例
+        symbols: 交易对列表
+        timeframe: 时间周期
+        limit: 每个交易对获取的K线数量
+        max_workers: 最大线程数
+
+    Returns:
+        {symbol: DataFrame} 字典，获取失败的为 None
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    cache = get_ohlcv_cache()
+    exchange_name = exchange_service.exchange_name
+    results: Dict[str, Optional[pd.DataFrame]] = {}
+
+    # 分离缓存命中和需要获取的交易对
+    symbols_to_fetch = []
+    for symbol in symbols:
+        cached_df = cache.get(exchange_name, symbol, timeframe)
+        if cached_df is not None:
+            results[symbol] = cached_df
+        else:
+            symbols_to_fetch.append(symbol)
+
+    if not symbols_to_fetch:
+        return results
+
+    logger.info(f"并行获取 {len(symbols_to_fetch)} 个交易对的 OHLCV 数据（线程池）")
+
+    def fetch_single(symbol: str) -> tuple:
+        """获取单个交易对的数据"""
+        try:
+            ohlcv = exchange_service.fetch_ohlcv(symbol, timeframe, limit=limit)
+            if not ohlcv:
+                return symbol, None
+
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+
+            # 存入缓存
+            cache.set(exchange_name, symbol, timeframe, df)
+
+            return symbol, df
+        except Exception as e:
+            logger.warning(f"获取 {symbol} OHLCV 数据失败: {e}")
+            return symbol, None
+
+    # 使用线程池并行执行
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_single, symbol): symbol for symbol in symbols_to_fetch}
+
+        for future in as_completed(futures):
+            try:
+                symbol, df = future.result()
+                results[symbol] = df
+            except Exception as e:
+                symbol = futures[future]
+                logger.error(f"获取 {symbol} OHLCV 数据异常: {e}")
+                results[symbol] = None
+
+    return results
 

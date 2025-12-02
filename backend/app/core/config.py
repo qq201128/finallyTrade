@@ -42,7 +42,29 @@ class Settings(BaseSettings):
     CACHE_TRADABLE_TTL: int = 120
     CACHE_TICKER_TTL: float = 1.0
     CACHE_OHLCV_TTL: int = 300  # OHLCV数据缓存有效期（秒），默认5分钟
-    
+
+    # 交易引擎配置
+    DEFAULT_OHLCV_LIMIT: int = 100  # 默认获取K线数量
+    DEFAULT_LEVERAGE: int = 1  # 默认杠杆倍数
+    DEFAULT_MARGIN_AMOUNT: float = 0.001  # 默认保证金（USDT）
+    DEFAULT_ROI_THRESHOLD: float = -0.1  # 默认止损ROI阈值（-10%）
+    DEFAULT_LOOP_INTERVAL: int = 10  # 默认交易循环间隔（秒）
+    OHLCV_FETCH_MAX_WORKERS: int = 5  # OHLCV 并行获取最大线程数
+    OHLCV_FETCH_MAX_CONCURRENT: int = 5  # OHLCV 异步并行获取最大并发数
+
+    # WebSocket 持仓推送配置
+    WS_POSITIONS_CACHE_TTL: float = 10.0  # 持仓缓存有效期（秒）
+    WS_BATCH_UPDATE_INTERVAL: float = 5.0  # 批量更新间隔（秒）
+    WS_MAX_BATCH_SIZE: int = 50  # 每次批量更新最大数量
+
+    # 价格缓存配置
+    PRICE_CACHE_TTL: int = 10  # 价格缓存有效期（秒）
+    PRICE_CACHE_MAX_SIZE: int = 1000  # 价格缓存最大条目数
+
+    # 线程配置
+    THREAD_STOP_TIMEOUT: int = 10  # 线程停止超时（秒）
+    THREAD_MONITOR_INTERVAL: int = 60  # 线程监控间隔（秒）
+
     # 监控与降级
     MONITORING_ENABLED: bool = False
     MONITORING_NAMESPACE: str = "trading_app"

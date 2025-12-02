@@ -36,7 +36,7 @@ class BaseStrategy(ABC):
         Args:
             symbols: 可交易对列表
         """
-        logger.info(f"[策略] 开始交易循环，可交易对数量: {len(symbols)}")
+        # logger.info(f"[策略] 开始交易循环，可交易对数量: {len(symbols)}")
     
     def after_loop(self, symbols: List[str]) -> None:
         """
@@ -45,7 +45,7 @@ class BaseStrategy(ABC):
         Args:
             symbols: 可交易对列表
         """
-        logger.info(f"[策略] 交易循环结束")
+        # logger.info(f"[策略] 交易循环结束")
     
     def order_filled(self, order, exchange_order: Dict[str, Any]) -> None:
         """

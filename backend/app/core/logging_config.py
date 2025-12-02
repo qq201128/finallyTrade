@@ -91,7 +91,18 @@ def setup_logging():
         strategy_logger = logging.getLogger(logger_name)
         strategy_logger.addHandler(strategy_error_handler)
         strategy_logger.setLevel(logging.INFO)
-    
+
+    # 5. 抑制第三方库的冗余日志
+    noisy_loggers = [
+        'watchfiles.main',  # uvicorn 文件监控
+        'watchfiles',
+        'httpcore',
+        'httpx',
+        'hpack',
+    ]
+    for logger_name in noisy_loggers:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
     logger = logging.getLogger(__name__)
     logger.info(f"日志系统已配置完成")
     logger.info(f"日志文件目录: {logs_dir.absolute()}")

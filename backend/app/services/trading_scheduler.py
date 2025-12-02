@@ -18,6 +18,10 @@ from app.services.trading_engine import TradingEngine
 from app.services.trading_engine_bidirectional import BidirectionalTradingEngine
 from app.core.config import settings
 
+# 使用配置常量
+THREAD_STOP_TIMEOUT = settings.THREAD_STOP_TIMEOUT
+THREAD_MONITOR_INTERVAL = settings.THREAD_MONITOR_INTERVAL
+
 logger = logging.getLogger(__name__)
 
 strategy_engine = StrategyEngine(settings.STRATEGIES_DIR)
@@ -29,6 +33,228 @@ thread_locks: Dict[int, threading.Lock] = {}  # 线程锁
 monitor_thread: Optional[threading.Thread] = None  # 监控线程
 monitor_running: bool = False  # 监控线程运行标志
 
+# ExchangeService 实例缓存: {strategy_id: (exchange_service, config_hash)}
+_exchange_service_cache: Dict[int, tuple] = {}
+_exchange_cache_lock = threading.Lock()
+
+
+def _get_config_hash(config: dict) -> str:
+    """生成配置的哈希值，用于检测配置是否变更"""
+    return f"{config['exchange_name']}_{config['api_key']}_{config['api_secret']}"
+
+
+def _get_or_create_exchange_service(
+    config: dict,
+    user_strategy_id: int
+) -> Optional[ExchangeService]:
+    """
+    获取或创建 ExchangeService 实例（带缓存）
+
+    只有当配置变更时才重新创建实例
+    """
+    config_hash = _get_config_hash(config)
+
+    with _exchange_cache_lock:
+        # 检查缓存中是否有该策略的 ExchangeService
+        if user_strategy_id in _exchange_service_cache:
+            cached_service, cached_hash = _exchange_service_cache[user_strategy_id]
+            # 配置未变更，复用现有实例
+            if cached_hash == config_hash:
+                logger.debug(f"策略 {user_strategy_id} 复用缓存的 ExchangeService")
+                return cached_service
+            else:
+                # 配置已变更，需要重新创建
+                logger.info(f"策略 {user_strategy_id} 配置已变更，重新创建 ExchangeService")
+
+        # 创建新的 ExchangeService 实例
+        try:
+            exchange_service = ExchangeService(
+                exchange_name=config['exchange_name'],
+                api_key=config['api_key'],
+                api_secret=config['api_secret']
+            )
+            # 缓存新实例
+            _exchange_service_cache[user_strategy_id] = (exchange_service, config_hash)
+            logger.debug(f"策略 {user_strategy_id} ExchangeService 初始化并缓存成功")
+            return exchange_service
+        except Exception as e:
+            logger.error(
+                f"策略 {user_strategy_id} ExchangeService 初始化异常: {e}",
+                exc_info=True
+            )
+            return None
+
+
+def _clear_exchange_service_cache(user_strategy_id: int = None):
+    """
+    清理 ExchangeService 缓存
+
+    Args:
+        user_strategy_id: 策略ID，如果为None则清理所有缓存
+    """
+    with _exchange_cache_lock:
+        if user_strategy_id is not None:
+            if user_strategy_id in _exchange_service_cache:
+                del _exchange_service_cache[user_strategy_id]
+                logger.debug(f"已清理策略 {user_strategy_id} 的 ExchangeService 缓存")
+        else:
+            _exchange_service_cache.clear()
+            logger.debug("已清理所有 ExchangeService 缓存")
+
+
+def _query_strategy_with_retry(user_strategy_id: int, max_retries: int = 3) -> Optional[UserStrategy]:
+    """
+    带重试机制的策略查询
+
+    Args:
+        user_strategy_id: 策略ID
+        max_retries: 最大重试次数
+
+    Returns:
+        UserStrategy 对象，如果查询失败返回 None
+    """
+    for retry_count in range(1, max_retries + 1):
+        try:
+            with get_db_context() as db:
+                user_strategy = db.query(UserStrategy).filter(
+                    UserStrategy.id == user_strategy_id
+                ).first()
+
+                if user_strategy:
+                    return user_strategy
+
+                if retry_count < max_retries:
+                    logger.warning(
+                        f"策略 {user_strategy_id} 查询返回 None (尝试 {retry_count}/{max_retries})，"
+                        f"可能是数据库连接问题，等待后重试..."
+                    )
+                    time.sleep(2)
+                else:
+                    logger.error(
+                        f"策略 {user_strategy_id} 在 {max_retries} 次重试后仍然查询不到"
+                    )
+        except Exception as e:
+            logger.warning(
+                f"策略 {user_strategy_id} 数据库查询异常 (尝试 {retry_count}/{max_retries}) - "
+                f"异常类型: {type(e).__name__}, 异常消息: {str(e)}"
+            )
+            if retry_count < max_retries:
+                time.sleep(2)
+    return None
+
+
+def _extract_strategy_config(user_strategy_id: int) -> Optional[dict]:
+    """
+    提取策略配置信息
+
+    Returns:
+        包含 exchange_name, api_key, api_secret, loop_interval, use_bidirectional 的字典
+    """
+    try:
+        with get_db_context() as db:
+            user_strategy = db.query(UserStrategy).filter(
+                UserStrategy.id == user_strategy_id
+            ).first()
+
+            if not user_strategy:
+                return None
+
+            try:
+                db.refresh(user_strategy)
+            except Exception:
+                pass
+
+            if not user_strategy.is_enabled:
+                logger.warning(f"策略 {user_strategy_id} 的 is_enabled 状态为 False")
+                return None
+
+            config = {
+                'exchange_name': user_strategy.exchange,
+                'api_key': user_strategy.api_key,
+                'api_secret': user_strategy.api_secret,
+                'loop_interval': settings.DEFAULT_LOOP_INTERVAL,
+                'use_bidirectional': False
+            }
+
+            if user_strategy.config:
+                config['loop_interval'] = user_strategy.config.get('loop_interval', settings.DEFAULT_LOOP_INTERVAL)
+                config['use_bidirectional'] = user_strategy.config.get('bidirectional_trading', False)
+
+            return config
+    except Exception as e:
+        logger.error(f"策略 {user_strategy_id} 提取配置异常: {e}", exc_info=True)
+        return None
+
+
+def _execute_trading_loop(
+    user_strategy_id: int,
+    exchange_service: ExchangeService,
+    use_bidirectional: bool,
+    loop_count: int
+) -> bool:
+    """
+    执行一次交易循环
+
+    Returns:
+        True 表示成功，False 表示失败
+    """
+    max_retries = 3
+
+    for retry_count in range(1, max_retries + 1):
+        try:
+            with get_db_context() as db:
+                user_strategy = db.query(UserStrategy).filter(
+                    UserStrategy.id == user_strategy_id
+                ).first()
+
+                if not user_strategy:
+                    if retry_count < max_retries:
+                        time.sleep(0.5 * retry_count)
+                        continue
+                    return False
+
+                try:
+                    db.refresh(user_strategy)
+                except Exception:
+                    pass
+
+                if not user_strategy.is_enabled:
+                    logger.warning(f"策略 {user_strategy_id} 已禁用，停止循环")
+                    running_flags[user_strategy_id] = False
+                    return False
+
+                # 创建交易引擎并执行
+                if use_bidirectional:
+                    trading_engine = BidirectionalTradingEngine(
+                        db=db,
+                        user_strategy=user_strategy,
+                        exchange_service=exchange_service,
+                        strategy_engine=strategy_engine
+                    )
+                else:
+                    trading_engine = TradingEngine(
+                        db=db,
+                        user_strategy=user_strategy,
+                        exchange_service=exchange_service,
+                        strategy_engine=strategy_engine
+                    )
+
+                trading_engine.run_trading_loop()
+                # logger.info(f"策略 {user_strategy_id} 第 {loop_count} 次循环完成")
+                return True
+
+        except Exception as e:
+            error_str = str(e).lower()
+            if "locked" in error_str or "database is locked" in error_str:
+                if retry_count < max_retries:
+                    logger.warning(f"策略 {user_strategy_id} 数据库锁定，重试 {retry_count}/{max_retries}")
+                    time.sleep(0.5 * retry_count)
+                    continue
+            logger.error(f"策略 {user_strategy_id} 执行交易循环异常: {e}", exc_info=True)
+            return False
+
+    return False
+
 
 def run_trading_loop_continuous(user_strategy_id: int):
     """
@@ -36,345 +262,63 @@ def run_trading_loop_continuous(user_strategy_id: int):
     执行完一次后立即开始下一次，直到策略被禁用
     """
     logger.info(f"开始为策略 {user_strategy_id} 启动连续循环")
-    
-    # 设置运行标志
     running_flags[user_strategy_id] = True
-    
-    loop_count = 0  # 循环计数器，用于日志记录
-    
+    loop_count = 0
+
     try:
         while running_flags.get(user_strategy_id, False):
             loop_count += 1
-            loop_interval = 10  # 默认等待时间
-            exchange_name = None
-            api_key = None
-            api_secret = None
-            use_bidirectional = False
-            exchange_service = None
-            
-            # 使用上下文管理器确保数据库会话正确关闭
-            # 添加重试机制，防止数据库连接问题导致误判
-            user_strategy = None
-            retry_count = 0
-            max_retries = 3
-            
-            while retry_count < max_retries:
-                try:
-                    with get_db_context() as db:
-                        # 检查策略是否仍然启用
-                        # 使用 refresh 确保读取到最新数据，避免缓存问题
-                        user_strategy = db.query(UserStrategy).filter(
-                            UserStrategy.id == user_strategy_id
-                        ).first()
-                        
-                        if user_strategy:
-                            break  # 查询成功，退出重试循环
-                        else:
-                            retry_count += 1
-                            if retry_count < max_retries:
-                                logger.warning(
-                                    f"策略 {user_strategy_id} 查询返回 None (尝试 {retry_count}/{max_retries})，"
-                                    f"可能是数据库连接问题，等待后重试..."
-                                )
-                                time.sleep(2)  # 等待2秒后重试
-                            else:
-                                # 重试次数用完，记录详细日志并停止
-                                logger.error(
-                                    f"策略 {user_strategy_id} 在 {max_retries} 次重试后仍然查询不到，"
-                                    f"停止循环。可能原因：策略已被删除、数据库连接问题、或数据库锁定"
-                                )
-                                # 最后一次尝试：直接查询数据库确认
-                                try:
-                                    with get_db_context() as db:
-                                        count = db.query(UserStrategy).filter(
-                                            UserStrategy.id == user_strategy_id
-                                        ).count()
-                                        logger.error(
-                                            f"策略 {user_strategy_id} 最终确认：数据库中存在 {count} 条记录"
-                                        )
-                                except Exception as e:
-                                    logger.error(f"最终确认查询失败: {e}")
-                                
-                                running_flags[user_strategy_id] = False
-                                break
-                except Exception as e:
-                    retry_count += 1
-                    exception_type = type(e).__name__
-                    exception_message = str(e)
-                    logger.warning(
-                        f"策略 {user_strategy_id} 数据库查询异常 (尝试 {retry_count}/{max_retries}) - "
-                        f"异常类型: {exception_type}, "
-                        f"异常消息: {exception_message}"
-                    )
-                    if retry_count < max_retries:
-                        time.sleep(2)  # 等待后重试
-                    else:
-                        logger.error(
-                            f"策略 {user_strategy_id} 数据库查询在 {max_retries} 次重试后仍然失败，"
-                            f"跳过本次循环，等待下次循环"
-                        )
-                        time.sleep(10)
-                        continue  # 跳过本次循环，继续下一次
-            
-            # 如果查询失败，跳过本次循环
+
+            # 1. 查询策略是否存在
+            user_strategy = _query_strategy_with_retry(user_strategy_id)
             if not user_strategy:
+                running_flags[user_strategy_id] = False
+                break
+
+            # 2. 提取策略配置
+            config = _extract_strategy_config(user_strategy_id)
+            if not config:
+                running_flags[user_strategy_id] = False
+                break
+
+            # 3. 获取或创建交易所服务（使用缓存）
+            exchange_service = _get_or_create_exchange_service(config, user_strategy_id)
+            if not exchange_service:
+                time.sleep(30)
                 continue
-                    
-            # 在查询成功后，再次打开会话进行后续操作
-            try:
-                with get_db_context() as db:
-                    # 重新查询以确保对象有效（因为之前的会话已关闭）
-                    user_strategy = db.query(UserStrategy).filter(
-                        UserStrategy.id == user_strategy_id
-                    ).first()
-                    
-                    if not user_strategy:
-                        logger.warning(f"策略 {user_strategy_id} 在后续查询中不存在，跳过本次循环")
-                        time.sleep(10)
-                        continue
-                    
-                    # 刷新对象以确保读取到最新状态（避免缓存问题）
-                    try:
-                        db.refresh(user_strategy)
-                    except Exception as e:
-                        logger.warning(f"刷新策略 {user_strategy_id} 状态失败: {e}，使用当前查询结果")
-                    
-                    # 记录当前状态用于调试
-                    current_enabled = user_strategy.is_enabled
-                    logger.debug(f"策略 {user_strategy_id} 当前状态检查: is_enabled={current_enabled}, exchange={user_strategy.exchange}")
-                    
-                    if not current_enabled:
-                        logger.warning(f"策略 {user_strategy_id} 的 is_enabled 状态为 False，停止循环。当前数据库状态: id={user_strategy.id}, is_enabled={user_strategy.is_enabled}, exchange={user_strategy.exchange}, user_id={user_strategy.user_id}")
-                        running_flags[user_strategy_id] = False
-                        break
-                    
-                    # 在会话关闭前提取所有需要的数据
-                    exchange_name = user_strategy.exchange
-                    api_key = user_strategy.api_key
-                    api_secret = user_strategy.api_secret
-                    
-                    # 获取配置信息（在会话内访问）
-                    if user_strategy.config:
-                        loop_interval = user_strategy.config.get('loop_interval', 10)
-                        use_bidirectional = user_strategy.config.get('bidirectional_trading', False)
-            except Exception as e:
-                # 详细记录数据库会话异常
-                exception_type = type(e).__name__
-                exception_message = str(e)
-                logger.error(
-                    f"策略 {user_strategy_id} 数据库会话异常终止 - "
-                    f"循环次数: {loop_count}, "
-                    f"异常类型: {exception_type}, "
-                    f"异常消息: {exception_message}",
-                    exc_info=True
-                )
-                time.sleep(10)
-                continue
-            
-            # 在数据库会话外创建交易所服务
-            try:
-                logger.info(f"策略 {user_strategy_id} 第 {loop_count} 次循环开始，交易所: {exchange_name}")
-                exchange_service = ExchangeService(
-                    exchange_name=exchange_name,
-                    api_key=api_key,
-                    api_secret=api_secret
-                )
-                logger.debug(f"策略 {user_strategy_id} ExchangeService 初始化成功")
-            except Exception as e:
-                # 详细记录 ExchangeService 初始化异常
-                exception_type = type(e).__name__
-                exception_message = str(e)
-                logger.error(
-                    f"策略 {user_strategy_id} ExchangeService 初始化异常终止 - "
-                    f"循环次数: {loop_count}, "
-                    f"异常类型: {exception_type}, "
-                    f"异常消息: {exception_message}, "
-                    f"交易所: {exchange_name}, "
-                    f"API密钥: {'已配置' if api_key else '未配置'}",
-                    exc_info=True
-                )
-                # ExchangeService 初始化失败，等待后继续下一次循环
-                time.sleep(30)  # 初始化失败时等待更长时间
-                continue  # 跳过本次循环，继续下一次
-            
-            # 执行交易循环（在独立的数据库会话中）
-            # 添加重试机制，处理SQLite多线程并发问题
-            user_strategy = None
-            query_retry_count = 0
-            max_query_retries = 3
-            
-            while query_retry_count < max_query_retries and not user_strategy:
-                try:
-                    with get_db_context() as db:
-                        # 重新查询用户策略（因为之前的会话已关闭）
-                        try:
-                            user_strategy = db.query(UserStrategy).filter(
-                                UserStrategy.id == user_strategy_id
-                            ).first()
-                        except Exception as query_error:
-                            error_str = str(query_error).lower()
-                            if "locked" in error_str or "database is locked" in error_str:
-                                query_retry_count += 1
-                                if query_retry_count < max_query_retries:
-                                    logger.warning(
-                                        f"策略 {user_strategy_id} 查询时数据库锁定 (尝试 {query_retry_count}/{max_query_retries})，"
-                                        f"等待后重试..."
-                                    )
-                                    time.sleep(0.5 * query_retry_count)  # 递增等待时间
-                                    continue
-                                else:
-                                    logger.error(f"策略 {user_strategy_id} 查询在 {max_query_retries} 次重试后仍然失败")
-                                    break
-                            else:
-                                raise  # 其他异常直接抛出
-                        
-                        if not user_strategy:
-                            # 查询失败，可能是数据库锁定或策略不存在
-                            query_retry_count += 1
-                            if query_retry_count < max_query_retries:
-                                logger.warning(
-                                    f"策略 {user_strategy_id} 查询返回 None (尝试 {query_retry_count}/{max_query_retries})，"
-                                    f"可能是数据库锁定，等待后重试..."
-                                )
-                                time.sleep(0.5 * query_retry_count)  # 递增等待时间
-                                continue  # 继续重试
-                            else:
-                                # 重试次数用完，详细记录并确认
-                                try:
-                                    # 先检查数据库中是否真的没有这个策略
-                                    all_strategies = db.query(UserStrategy).all()
-                                    strategy_ids = [s.id for s in all_strategies]
-                                    logger.error(
-                                        f"策略 {user_strategy_id} 在 {max_query_retries} 次重试后仍然查询不到 - "
-                                        f"循环次数: {loop_count}, "
-                                        f"数据库中当前存在的策略ID: {strategy_ids}, "
-                                        f"查询的ID {user_strategy_id} {'不在' if user_strategy_id not in strategy_ids else '在'}列表中"
-                                    )
-                                    
-                                    if user_strategy_id not in strategy_ids:
-                                        # 策略确实不存在，停止循环
-                                        logger.error(f"策略 {user_strategy_id} 确认已被删除，停止循环")
-                                        running_flags[user_strategy_id] = False
-                                        break
-                                    else:
-                                        # 策略存在但查询失败，可能是数据库锁定，跳过本次循环
-                                        logger.warning(f"策略 {user_strategy_id} 存在但查询失败，跳过本次循环，等待下次")
-                                        time.sleep(10)
-                                        continue  # 跳过本次循环，继续下一次
-                                except Exception as confirm_error:
-                                    logger.error(
-                                        f"确认策略 {user_strategy_id} 状态失败: {confirm_error}, "
-                                        f"异常类型: {type(confirm_error).__name__}",
-                                        exc_info=True
-                                    )
-                                    # 无法确认，跳过本次循环
-                                    time.sleep(10)
-                                    continue
-                        
-                        # 如果查询成功，继续执行交易循环
-                        if user_strategy:
-                            # 刷新对象以确保读取到最新状态
-                            try:
-                                db.refresh(user_strategy)
-                            except Exception as e:
-                                logger.warning(f"刷新策略 {user_strategy_id} 状态失败: {e}，使用当前查询结果")
-                            
-                            # 记录当前状态用于调试
-                            current_enabled = user_strategy.is_enabled
-                            logger.debug(f"策略 {user_strategy_id} 在执行交易循环时状态检查: is_enabled={current_enabled}")
-                            
-                            if not current_enabled:
-                                logger.warning(f"策略 {user_strategy_id} 在执行交易循环时 is_enabled 状态为 False，停止循环。当前数据库状态: id={user_strategy.id}, is_enabled={user_strategy.is_enabled}, exchange={user_strategy.exchange}, user_id={user_strategy.user_id}")
-                                running_flags[user_strategy_id] = False
-                                break
-                            
-                            if use_bidirectional:
-                                # 使用双向交易引擎
-                                logger.info(f"策略 {user_strategy_id} 使用双向交易引擎")
-                                trading_engine = BidirectionalTradingEngine(
-                                    db=db,
-                                    user_strategy=user_strategy,
-                                    exchange_service=exchange_service,
-                                    strategy_engine=strategy_engine
-                                )
-                            else:
-                                # 使用原有交易引擎
-                                trading_engine = TradingEngine(
-                                    db=db,
-                                    user_strategy=user_strategy,
-                                    exchange_service=exchange_service,
-                                    strategy_engine=strategy_engine
-                                )
-                            
-                            # 执行一次交易循环
-                            trading_engine.run_trading_loop()
-                            logger.info(f"策略 {user_strategy_id} 第 {loop_count} 次循环完成")
-                            break  # 成功执行后退出重试循环
-                except Exception as loop_error:
-                    query_retry_count += 1
-                    error_str = str(loop_error).lower()
-                    if "locked" in error_str or "database is locked" in error_str:
-                        if query_retry_count < max_query_retries:
-                            logger.warning(
-                                f"策略 {user_strategy_id} 执行交易循环时数据库锁定 (尝试 {query_retry_count}/{max_query_retries})，"
-                                f"等待后重试..."
-                            )
-                            time.sleep(0.5 * query_retry_count)
-                            continue
-                        else:
-                            logger.error(f"策略 {user_strategy_id} 在 {max_query_retries} 次重试后仍然失败")
-                            time.sleep(10)
-                            continue  # 跳过本次循环
-                    else:
-                        # 其他异常，记录并跳过本次循环
-                        logger.error(
-                            f"策略 {user_strategy_id} 执行交易循环异常: {loop_error}, "
-                            f"异常类型: {type(loop_error).__name__}",
-                            exc_info=True
-                        )
-                        time.sleep(10)
-                        continue  # 跳过本次循环
-            
-            # 如果查询失败（重试后仍然失败），跳过本次循环
-            if not user_strategy:
-                logger.warning(f"策略 {user_strategy_id} 查询失败，跳过本次循环")
-                time.sleep(10)
-                continue
-            
-            # 循环完成后等待一段时间再开始下一次，避免无限快速循环
-            # 可以根据需要调整等待时间（秒），建议至少5-10秒
-            time.sleep(loop_interval)
-        
-        # 记录策略循环停止信息（包括是否异常终止）
-        final_loop_count = loop_count
+
+            # 4. 执行交易循环
+            success = _execute_trading_loop(
+                user_strategy_id,
+                exchange_service,
+                config['use_bidirectional'],
+                loop_count
+            )
+
+            if not success and not running_flags.get(user_strategy_id, False):
+                break
+
+            # 5. 等待下一次循环
+            time.sleep(config['loop_interval'])
+
         logger.info(
             f"策略 {user_strategy_id} 的循环已停止 - "
-            f"总循环次数: {final_loop_count}, "
-            f"停止原因: {'正常停止' if not running_flags.get(user_strategy_id, False) else '异常终止'}"
+            f"总循环次数: {loop_count}, 停止原因: 正常停止"
         )
     except Exception as e:
-        # 捕获最外层未预期的异常，确保策略异常终止时能记录详细信息
-        exception_type = type(e).__name__
-        exception_message = str(e)
         logger.critical(
             f"策略 {user_strategy_id} 发生严重异常导致循环终止 - "
-            f"循环次数: {loop_count}, "
-            f"异常类型: {exception_type}, "
-            f"异常消息: {exception_message}, "
-            f"运行标志: {running_flags.get(user_strategy_id, False)}, "
-            f"此异常可能导致策略完全停止运行",
+            f"循环次数: {loop_count}, 异常: {e}",
             exc_info=True
         )
-        # 确保运行标志被清除，防止资源泄漏
         running_flags[user_strategy_id] = False
     finally:
-        # 最终清理资源，确保即使发生异常也能清理
-        if user_strategy_id in running_threads:
-            del running_threads[user_strategy_id]
-        if user_strategy_id in running_flags:
-            del running_flags[user_strategy_id]
-        if user_strategy_id in thread_locks:
-            del thread_locks[user_strategy_id]
+        # 清理资源
+        running_threads.pop(user_strategy_id, None)
+        running_flags.pop(user_strategy_id, None)
+        thread_locks.pop(user_strategy_id, None)
+        # 清理 ExchangeService 缓存
+        _clear_exchange_service_cache(user_strategy_id)
 
 
 def start_strategy(user_strategy_id: int):
@@ -447,11 +391,11 @@ def stop_strategy(user_strategy_id: int):
     # 设置停止标志
     running_flags[user_strategy_id] = False
     
-    # 等待线程结束（最多等待10秒）
+    # 等待线程结束
     if user_strategy_id in running_threads:
         thread = running_threads[user_strategy_id]
         if thread.is_alive():
-            thread.join(timeout=10)
+            thread.join(timeout=THREAD_STOP_TIMEOUT)
             if thread.is_alive():
                 logger.warning(f"策略 {user_strategy_id} 的线程未能及时停止")
     
@@ -511,42 +455,54 @@ def start_trading_scheduler():
     系统重启后会自动恢复所有启用的策略
     """
     try:
+        # 先从数据库获取策略信息，提取所需字段后再关闭会话
+        strategies_to_start = []
         with get_db_context() as db:
             # 获取所有启用的策略
             user_strategies = db.query(UserStrategy).filter(
                 UserStrategy.is_enabled == True
             ).all()
-            
+
             if not user_strategies:
                 logger.info("没有发现启用的策略")
                 return
-            
+
             logger.info(f"发现 {len(user_strategies)} 个启用的策略，开始恢复连续循环...")
-            
-            success_count = 0
-            fail_count = 0
-            
+
+            # 在会话关闭前提取所需的属性值
             for user_strategy in user_strategies:
-                try:
-                    # 检查策略是否已经在运行（防止重复启动）
-                    if user_strategy.id in running_threads:
-                        thread = running_threads[user_strategy.id]
-                        if thread.is_alive():
-                            logger.debug(f"策略 {user_strategy.id} 已在运行中，跳过")
-                            continue
-                    
-                    # 启动策略
-                    if start_strategy(user_strategy.id):
-                        success_count += 1
-                        logger.info(f"策略 {user_strategy.id} ({user_strategy.exchange}) 恢复成功")
-                    else:
-                        fail_count += 1
-                        logger.warning(f"策略 {user_strategy.id} 恢复失败")
-                except Exception as e:
+                strategies_to_start.append({
+                    'id': user_strategy.id,
+                    'exchange': user_strategy.exchange
+                })
+
+        # 在会话关闭后启动策略
+        success_count = 0
+        fail_count = 0
+
+        for strategy_info in strategies_to_start:
+            strategy_id = strategy_info['id']
+            exchange = strategy_info['exchange']
+            try:
+                # 检查策略是否已经在运行（防止重复启动）
+                if strategy_id in running_threads:
+                    thread = running_threads[strategy_id]
+                    if thread.is_alive():
+                        logger.debug(f"策略 {strategy_id} 已在运行中，跳过")
+                        continue
+
+                # 启动策略
+                if start_strategy(strategy_id):
+                    success_count += 1
+                    logger.info(f"策略 {strategy_id} ({exchange}) 恢复成功")
+                else:
                     fail_count += 1
-                    logger.error(f"启动策略 {user_strategy.id} 失败: {e}", exc_info=True)
-            
-            logger.info(f"交易调度器启动完成: 成功恢复 {success_count} 个策略，失败 {fail_count} 个策略")
+                    logger.warning(f"策略 {strategy_id} 恢复失败")
+            except Exception as e:
+                fail_count += 1
+                logger.error(f"启动策略 {strategy_id} 失败: {e}", exc_info=True)
+
+        logger.info(f"交易调度器启动完成: 成功恢复 {success_count} 个策略，失败 {fail_count} 个策略")
     except Exception as e:
         logger.error(f"启动交易调度器失败: {e}", exc_info=True)
 
@@ -676,8 +632,8 @@ def _monitor_threads_loop():
     
     while monitor_running:
         try:
-            # 每分钟检查一次
-            time.sleep(60)
+            # 定期检查
+            time.sleep(THREAD_MONITOR_INTERVAL)
             
             if not monitor_running:
                 break

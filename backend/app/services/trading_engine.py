@@ -1,215 +1,57 @@
 """
 交易执行引擎 - 实现系统逻辑循环
 """
-import asyncio
 import logging
 from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
+from datetime import datetime
 from sqlalchemy.orm import Session
 from app.models import Position, Order, UserStrategy, PnLRecord
 from app.models.trade import OrderStatus, OrderSide, OrderType
 from app.services.exchange_service import ExchangeService
 from app.services.strategy_engine import StrategyEngine
-from app.services.ohlcv_cache import get_ohlcv_cache
+from app.services.base_trading_engine import BaseTradingEngine
+from app.services.ohlcv_cache import fetch_ohlcv_batch_sync
 from app.core.config import settings
+from app.utils.timeframe import parse_timeframe, get_candle_start_timestamp
+from app.utils.websocket_push import push_position_update_sync
 import pandas as pd
-import re
 
 logger = logging.getLogger(__name__)
 
 
-class TradingEngine:
+class TradingEngine(BaseTradingEngine):
     """交易执行引擎"""
-    
-    def __init__(self, db: Session, user_strategy: UserStrategy, 
+
+    def __init__(self, db: Session, user_strategy: UserStrategy,
                  exchange_service: ExchangeService, strategy_engine: StrategyEngine):
         """
         初始化交易引擎
-        
+
         Args:
             db: 数据库会话
             user_strategy: 用户策略配置
             exchange_service: 交易所服务
             strategy_engine: 策略引擎
         """
-        self.db = db
-        self.user_strategy = user_strategy
-        self.exchange_service = exchange_service
-        self.strategy_engine = strategy_engine
-        self.strategy_module = None
-        # 使用全局共享的OHLCV缓存
-        self.ohlcv_cache = get_ohlcv_cache(ttl_seconds=settings.CACHE_OHLCV_TTL)
-        
-        # 加载策略
-        self._load_strategy()
-    
-    @staticmethod
-    def _parse_timeframe(timeframe: str) -> int:
+        super().__init__(db, user_strategy, exchange_service, strategy_engine)
+
+    # 注意：_get_candle_start_timestamp, _get_last_close_candle_timestamp,
+    # _set_last_close_candle_timestamp 方法已移到基类 BaseTradingEngine
+
+    def get_open_positions(self, symbol: str = None, side: str = None) -> List[Position]:
         """
-        解析时间周期字符串，返回秒数
-        
+        步骤1: 从持久化存储中获取未平仓交易
+
         Args:
-            timeframe: 时间周期字符串，如 '1m', '5m', '1h', '1d'
-        
-        Returns:
-            秒数
+            symbol: 交易对（可选，TradingEngine 不使用）
+            side: 方向（可选，TradingEngine 不使用）
         """
-        match = re.match(r'(\d+)([smhd])', timeframe.lower())
-        if not match:
-            return 3600  # 默认1小时
-        
-        value = int(match.group(1))
-        unit = match.group(2)
-        
-        if unit == 's':
-            return value
-        elif unit == 'm':
-            return value * 60
-        elif unit == 'h':
-            return value * 3600
-        elif unit == 'd':
-            return value * 86400
-        else:
-            return 3600
-    
-    def _get_candle_start_timestamp(self, timestamp: datetime, timeframe: str) -> datetime:
-        """
-        获取K线周期的开始时间戳
-        
-        Args:
-            timestamp: 时间戳
-            timeframe: 时间周期字符串
-        
-        Returns:
-            K线周期的开始时间戳
-        """
-        seconds = self._parse_timeframe(timeframe)
-        # 将时间戳转换为Unix时间戳（秒）
-        unix_timestamp = int(timestamp.timestamp())
-        # 计算K线周期的开始时间戳
-        candle_start = unix_timestamp // seconds * seconds
-        return datetime.fromtimestamp(candle_start)
-    
-    def _get_last_close_candle_timestamp(self, symbol: str) -> Optional[datetime]:
-        """
-        获取指定交易对最后平仓的K线周期时间戳
-        
-        Args:
-            symbol: 交易对
-        
-        Returns:
-            最后平仓的K线周期开始时间戳，如果没有则返回None
-        """
-        if not self.user_strategy.config:
-            return None
-        
-        last_close_times = self.user_strategy.config.get('last_close_candle_times', {})
-        timestamp_str = last_close_times.get(symbol)
-        if timestamp_str:
-            try:
-                return datetime.fromisoformat(timestamp_str)
-            except (ValueError, TypeError):
-                return None
-        return None
-    
-    def _set_last_close_candle_timestamp(self, symbol: str, timestamp: datetime):
-        """
-        设置指定交易对最后平仓的K线周期时间戳
-        
-        Args:
-            symbol: 交易对
-            timestamp: K线周期开始时间戳
-        """
-        if not self.user_strategy.config:
-            self.user_strategy.config = {}
-        
-        if 'last_close_candle_times' not in self.user_strategy.config:
-            self.user_strategy.config['last_close_candle_times'] = {}
-        
-        self.user_strategy.config['last_close_candle_times'][symbol] = timestamp.isoformat()
-        self.db.commit()
-    
-    def _load_strategy(self):
-        """加载策略模块"""
-        try:
-            self.strategy_module = self.strategy_engine.load_strategy(
-                self.user_strategy.strategy.name,
-                self.user_strategy.strategy.file_path
-            )
-        except Exception as e:
-            logger.error(f"加载策略失败: {e}")
-            raise
-    
-    def get_open_positions(self) -> List[Position]:
-        """步骤1: 从持久化存储中获取未平仓交易"""
         positions = self.db.query(Position).filter(
             Position.user_id == self.user_strategy.user_id,
             Position.user_strategy_id == self.user_strategy.id,
             Position.is_open == True
         ).all()
         return positions
-    
-    def get_tradable_symbols(self) -> List[str]:
-        """步骤2: 计算当前可交易的交易对列表"""
-        try:
-            symbols = self.exchange_service.get_tradable_symbols()
-            # 如果用户配置了币种列表，只使用配置的币种（只支持永续合约）
-            if self.user_strategy.symbols and len(self.user_strategy.symbols) > 0:
-                allowed_symbols = self.user_strategy.symbols
-                symbols = [s for s in symbols if s in allowed_symbols]
-                logger.info(f"使用配置的币种列表: {allowed_symbols}, 过滤后: {len(symbols)} 个交易对")
-            return symbols
-        except Exception as e:
-            logger.error(f"获取可交易对列表失败: {e}")
-            return []
-    
-    def fetch_ohlcv_data(self, symbol: str, timeframe: str = None, 
-                        limit: int = 100) -> Optional[pd.DataFrame]:
-        """
-        步骤3: 下载交易对列表的OHLCV数据
-        使用全局共享缓存，多个策略可以共享相同交易对的K线数据
-        """
-        # 使用用户配置的时间周期，如果没有则使用默认值
-        if timeframe is None:
-            timeframe = self.user_strategy.timeframe if self.user_strategy.timeframe else '1h'
-        
-        # 从全局共享缓存获取
-        exchange_name = self.exchange_service.exchange_name
-        cached_df = self.ohlcv_cache.get(exchange_name, symbol, timeframe)
-        if cached_df is not None:
-            logger.debug(f"从共享缓存获取OHLCV数据: {exchange_name}:{symbol}:{timeframe}")
-            return cached_df
-        
-        # 缓存未命中，从交易所获取
-        try:
-            logger.debug(f"从交易所获取OHLCV数据: {exchange_name}:{symbol}:{timeframe}")
-            ohlcv = self.exchange_service.fetch_ohlcv(symbol, timeframe, limit=limit)
-            if not ohlcv:
-                return None
-            
-            # 转换为DataFrame
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            
-            # 存储到全局共享缓存
-            self.ohlcv_cache.set(exchange_name, symbol, timeframe, df)
-            
-            return df
-        except Exception as e:
-            logger.error(f"获取 {symbol} OHLCV数据失败: {e}")
-            return None
-    
-    def call_strategy_callback(self, callback_name: str, *args, **kwargs):
-        """
-        步骤4: 调用策略回调函数
-        用于执行与货币对无关的计算（适用于所有货币对）、加载外部数据等
-        """
-        if self.strategy_module:
-            return self.strategy_engine.call_strategy_callback(
-                self.strategy_module, callback_name, *args, **kwargs
-            )
-        return None
     
     def analyze_strategy(self, symbol: str, dataframe: pd.DataFrame) -> Dict[str, bool]:
         """
@@ -264,43 +106,6 @@ class TradingEngine:
             'exit_signal': exit_signal,
             'dataframe': dataframe
         }
-    
-    def update_order_status(self):
-        """
-        步骤6: 从交易所更新交易的挂单状态
-        回调order_filled()用于在订单成交后，根据当前的交易状态执行特定操作
-        """
-        try:
-            # 获取所有待处理的订单
-            pending_orders = self.db.query(Order).filter(
-                Order.user_id == self.user_strategy.user_id,
-                Order.status.in_([OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED])
-            ).all()
-            
-            for order in pending_orders:
-                try:
-                    # 从交易所获取最新订单状态
-                    exchange_order = self.exchange_service.fetch_order(
-                        order.exchange_order_id, order.symbol
-                    )
-                    
-                    # 更新订单状态
-                    order.status = OrderStatus(exchange_order.get('status', 'pending'))
-                    order.filled = exchange_order.get('filled', 0.0)
-                    order.cost = exchange_order.get('cost', 0.0)
-                    order.fee = exchange_order.get('fee', {}).get('cost', 0.0)
-                    
-                    # 如果订单已成交，调用order_filled回调
-                    if order.status == OrderStatus.FILLED:
-                        order.filled_at = datetime.now()
-                        self.order_filled(order, exchange_order)
-                    
-                    self.db.commit()
-                except Exception as e:
-                    logger.error(f"更新订单 {order.id} 状态失败: {e}")
-                    continue
-        except Exception as e:
-            logger.error(f"更新订单状态失败: {e}")
     
     def order_filled(self, order: Order, exchange_order: Dict):
         """
@@ -435,63 +240,11 @@ class TradingEngine:
             
             # 如果持仓已完全关闭，推送 WebSocket 更新通知前端
             if position_was_closed:
-                try:
-                    import asyncio
-                    from app.api.websocket import manager
-                    
-                    # 创建异步任务推送 WebSocket 更新
-                    position_data = {
-                        "id": position.id,
-                        "symbol": position.symbol,
-                        "side": position.side,
-                        "size": 0,
-                        "entry_price": position.entry_price,
-                        "current_price": exit_price,
-                        "unrealized_pnl": 0,
-                        "leverage": position.leverage or 1,
-                        "margin_used": 0,
-                        "pnl_percentage": 0,
-                        "is_open": False
-                    }
-                    message = {
-                        "type": "positions",
-                        "data": [position_data]
-                    }
-                    
-                    # 在后台线程中运行异步推送（交易引擎在独立线程中运行）
-                    # 使用 asyncio.run 在 Python 3.7+ 中安全运行
-                    try:
-                        # 尝试获取当前事件循环
-                        try:
-                            loop = asyncio.get_running_loop()
-                            # 如果有运行中的事件循环，使用 create_task
-                            asyncio.create_task(self._push_position_update_async(message, position.user_id))
-                        except RuntimeError:
-                            # 没有运行中的事件循环，使用 asyncio.run
-                            asyncio.run(self._push_position_update_async(message, position.user_id))
-                    except Exception as e:
-                        logger.warning(f"推送平仓 WebSocket 更新失败: {e}")
-                except Exception as e:
-                    logger.warning(f"推送平仓 WebSocket 更新失败: {e}")
+                push_position_update_sync(position, exit_price, is_closed=True)
         except Exception as e:
             logger.error(f"关闭持仓失败: {e}")
             self.db.rollback()
-    
-    async def _push_position_update_async(self, message: dict, user_id: int):
-        """异步推送持仓更新到 WebSocket"""
-        try:
-            from app.api.websocket import manager
-            # 发送给该用户的所有连接
-            for connection in manager.active_connections:
-                connection_user_id = manager.connection_users.get(connection)
-                if connection_user_id == user_id:
-                    try:
-                        await manager.send_personal_message(message, connection)
-                    except Exception as e:
-                        logger.debug(f"推送平仓更新失败: {e}")
-        except Exception as e:
-            logger.warning(f"推送 WebSocket 更新失败: {e}")
-    
+
     def verify_and_close_positions(self, symbol: str, analysis_result: Dict):
         """
         步骤7: 验证现有持仓并视情况下达卖出平仓订单
@@ -507,11 +260,13 @@ class TradingEngine:
         
         for position in positions:
             try:
-                # 获取当前价格
-                ticker = self.exchange_service.exchange.fetch_ticker(symbol)
-                current_price = ticker['last']
+                # 获取当前价格（使用缓存避免重复 API 调用）
+                current_price = self._get_cached_price(symbol)
+                if not current_price:
+                    logger.warning(f"无法获取 {symbol} 价格，跳过持仓检查")
+                    continue
                 position.current_price = current_price
-                
+
                 # 计算未实现盈亏
                 qty = abs(position.size or 0)
                 position.unrealized_pnl = (current_price - position.entry_price) * qty
@@ -535,7 +290,7 @@ class TradingEngine:
                     logger.info(f"触发止盈: {symbol}")
                 
                 # 检查ROI（从配置中获取）
-                roi_threshold = self.user_strategy.config.get('stop_loss_roi', -0.1)  # 默认-10%
+                roi_threshold = self.user_strategy.config.get('stop_loss_roi', settings.DEFAULT_ROI_THRESHOLD)
                 current_roi = (current_price - position.entry_price) / position.entry_price
                 if current_roi <= roi_threshold:
                     should_close = True
@@ -747,31 +502,30 @@ class TradingEngine:
         try:
             # 获取保证金（从用户配置中，trade_amount 现在代表保证金）
             try:
-                margin_amount = float(self.user_strategy.trade_amount) if self.user_strategy.trade_amount else 0.001
+                margin_amount = float(self.user_strategy.trade_amount) if self.user_strategy.trade_amount else settings.DEFAULT_MARGIN_AMOUNT
             except (ValueError, TypeError):
-                margin_amount = 0.001  # 默认值
-                logger.warning(f"无法解析交易数量配置 '{self.user_strategy.trade_amount}'，使用默认值 0.001 USDT")
-            
-            # 获取杠杆倍数（从配置中获取，默认1倍）
-            leverage = self.user_strategy.config.get('leverage', 1) or 1
+                margin_amount = settings.DEFAULT_MARGIN_AMOUNT
+                logger.warning(f"无法解析交易数量配置 '{self.user_strategy.trade_amount}'，使用默认值 {settings.DEFAULT_MARGIN_AMOUNT} USDT")
+
+            # 获取杠杆倍数（从配置中获取）
+            leverage = self.user_strategy.config.get('leverage', settings.DEFAULT_LEVERAGE) or settings.DEFAULT_LEVERAGE
             if leverage <= 0:
                 leverage = 1
             
             # 计算名义价值：名义价值 = 保证金 × 杠杆
             notional_value = margin_amount * leverage
             
-            # 获取当前市场价格（用于将名义价值转换为币种数量）
-            try:
-                ticker = self.exchange_service.exchange.fetch_ticker(symbol)
-                current_price = ticker.get('last', 0)
-                if current_price == 0:
-                    # 如果获取不到价格，尝试从OHLCV数据获取
+            # 获取当前市场价格（使用缓存避免重复 API 调用）
+            current_price = self._get_cached_price(symbol)
+            if not current_price:
+                # 如果获取不到价格，尝试从OHLCV数据获取
+                try:
                     ohlcv = self.exchange_service.fetch_ohlcv(symbol, self.user_strategy.timeframe, limit=1)
                     if ohlcv and len(ohlcv) > 0:
                         current_price = ohlcv[-1][4]  # close price
-            except Exception as e:
-                logger.warning(f"获取 {symbol} 价格失败: {e}，无法计算币种数量")
-                current_price = 0
+                        self._price_cache[symbol] = current_price
+                except Exception as e:
+                    logger.warning(f"获取 {symbol} OHLCV 价格失败: {e}")
             
             if current_price <= 0:
                 logger.error(f"无法获取 {symbol} 的价格，跳过开仓")
@@ -850,10 +604,9 @@ class TradingEngine:
             positions = self.get_open_positions()
             for position in positions:
                 try:
-                    # 获取当前价格
-                    ticker = self.exchange_service.exchange.fetch_ticker(position.symbol)
-                    current_price = ticker.get('last', 0)
-                    if current_price > 0:
+                    # 获取当前价格（使用缓存避免重复 API 调用）
+                    current_price = self._get_cached_price(position.symbol)
+                    if current_price and current_price > 0:
                         position.current_price = current_price
                         # 计算未实现盈亏
                         if position.entry_price:
@@ -872,7 +625,10 @@ class TradingEngine:
         此循环将不断重复，直到机器人停止
         """
         logger.info(f"开始交易循环: 用户策略 {self.user_strategy.id}")
-        
+
+        # 清空价格缓存，确保每次循环获取最新价格
+        self._clear_price_cache()
+
         try:
             # 步骤1: 获取未平仓交易
             open_positions = self.get_open_positions()
@@ -887,32 +643,53 @@ class TradingEngine:
             
             # 步骤4: 调用策略回调函数（与货币对无关的计算）
             self.call_strategy_callback('before_loop', tradable_symbols)
-            
-            # 步骤3和5: 对每个交易对进行分析
+
+            # 步骤3: 批量并行获取所有交易对的 OHLCV 数据
+            timeframe = self.get_timeframe()
+            ohlcv_data = fetch_ohlcv_batch_sync(
+                self.exchange_service,
+                tradable_symbols,
+                timeframe,
+                limit=settings.DEFAULT_OHLCV_LIMIT,
+                max_workers=5
+            )
+            logger.info(f"批量获取 OHLCV 数据完成: {sum(1 for v in ohlcv_data.values() if v is not None)}/{len(tradable_symbols)} 成功")
+
+            # 步骤5: 对每个交易对进行分析
+            # 步骤6: 更新订单状态（移到循环外，只需执行一次）
+            self.update_order_status()
+
+            # 将持仓按 symbol 分组（优化：避免循环内重复遍历）
+            positions_by_symbol: Dict[str, List[Position]] = {}
+            for pos in open_positions:
+                if pos.symbol not in positions_by_symbol:
+                    positions_by_symbol[pos.symbol] = []
+                positions_by_symbol[pos.symbol].append(pos)
+
             for symbol in tradable_symbols:
                 try:
-                    # 步骤3: 下载OHLCV数据
-                    dataframe = self.fetch_ohlcv_data(symbol)
+                    # 从批量获取的结果中取数据
+                    dataframe = ohlcv_data.get(symbol)
                     if dataframe is None or dataframe.empty:
                         continue
-                    
+
                     # 步骤5: 分析策略
                     analysis_result = self.analyze_strategy(symbol, dataframe)
-                    
-                    # 步骤6: 更新订单状态
-                    self.update_order_status()
-                    
+
                     # 步骤7: 验证并平仓
                     self.verify_and_close_positions(symbol, analysis_result)
-                    
-                    # 步骤8: 仓位调整
-                    for position in open_positions:
-                        if position.symbol == symbol:
-                            self.adjust_position_size(position)
-                    
+
+                    # 步骤8: 仓位调整（使用预分组的持仓，过滤已关闭的）
+                    symbol_positions = [
+                        pos for pos in positions_by_symbol.get(symbol, [])
+                        if pos.is_open
+                    ]
+                    for position in symbol_positions:
+                        self.adjust_position_size(position)
+
                     # 步骤9: 验证并开仓
                     self.verify_and_open_positions(symbol, analysis_result)
-                    
+
                 except Exception as e:
                     logger.error(f"处理交易对 {symbol} 失败: {e}")
                     continue

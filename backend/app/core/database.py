@@ -3,55 +3,58 @@
 """
 from sqlalchemy import create_engine, event
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.pool import QueuePool, StaticPool, NullPool
 from app.core.config import settings
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
 # 根据数据库类型配置连接池
 # 多用户场景下，需要支持大量并发策略
 if "sqlite" in settings.DATABASE_URL:
-    # SQLite 使用 StaticPool，适合多线程环境
-    # StaticPool 会为每个线程创建独立的连接，避免连接池溢出
-    # 启用WAL模式提高并发性能，减少锁定问题
+    # SQLite 多线程解决方案：
+    # 1. 使用 NullPool（不使用连接池），每次请求创建新连接
+    # 2. 配合 scoped_session 确保每个线程有独立的会话
+    # 这样可以避免 "bad parameter or other API misuse" 错误
     def _set_sqlite_pragma(dbapi_conn, connection_record):
         """设置SQLite的PRAGMA参数，优化多线程并发性能"""
         try:
+            cursor = dbapi_conn.cursor()
             # 启用WAL模式（Write-Ahead Logging），提高并发性能
-            dbapi_conn.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA journal_mode=WAL")
             # 设置忙等待超时（毫秒），避免数据库锁定
-            dbapi_conn.execute("PRAGMA busy_timeout=30000")  # 30秒
+            cursor.execute("PRAGMA busy_timeout=30000")  # 30秒
             # 启用外键约束
-            dbapi_conn.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA foreign_keys=ON")
             # 设置同步模式为NORMAL（WAL模式下推荐）
-            dbapi_conn.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             # 设置缓存大小（64MB），提高性能
-            dbapi_conn.execute("PRAGMA cache_size=-65536")  # 64MB
+            cursor.execute("PRAGMA cache_size=-65536")  # 64MB
+            cursor.close()
         except Exception as e:
             logger.warning(f"设置SQLite PRAGMA失败: {e}")
-    
+
     engine = create_engine(
         settings.DATABASE_URL,
-        poolclass=StaticPool,
+        poolclass=NullPool,  # 不使用连接池，每次创建新连接
         connect_args={
-            "check_same_thread": False,
+            "check_same_thread": False,  # 允许多线程访问
             "timeout": 30  # SQLite 连接超时
         },
-        pool_pre_ping=True,  # 连接前检查连接是否有效
         echo=False
     )
-    # 注册事件监听器，在连接创建时设置PRAGMA（使用新API）
+    # 注册事件监听器，在连接创建时设置PRAGMA
     event.listen(engine, "connect", _set_sqlite_pragma)
-    logger.info("使用 SQLite 数据库，配置为 StaticPool（多线程安全），已启用WAL模式")
+    logger.info("使用 SQLite 数据库，配置为 NullPool（多线程安全），已启用WAL模式")
 else:
     # PostgreSQL/MySQL 等使用连接池
     # 多用户场景：假设每个用户平均3个策略，10个用户需要30个连接
     # 设置更大的连接池以支持多用户并发
     pool_size = getattr(settings, 'DB_POOL_SIZE', 50)  # 基础连接池大小
     max_overflow = getattr(settings, 'DB_MAX_OVERFLOW', 50)  # 溢出连接数（总连接数可达100）
-    
+
     engine = create_engine(
         settings.DATABASE_URL,
         poolclass=QueuePool,
@@ -64,7 +67,10 @@ else:
     )
     logger.info(f"使用 {settings.DATABASE_URL.split('://')[0]} 数据库，连接池大小: {pool_size}, 最大溢出: {max_overflow}")
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# 创建线程本地的会话工厂
+_session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# 使用 scoped_session 确保每个线程有独立的会话实例
+SessionLocal = scoped_session(_session_factory)
 
 Base = declarative_base()
 
@@ -75,16 +81,17 @@ def get_db():
     try:
         yield db
     finally:
-        db.close()
+        # scoped_session 需要调用 remove() 来清理线程本地会话
+        SessionLocal.remove()
 
 
 def get_db_session():
     """
     获取数据库会话（用于非FastAPI场景）
-    注意：使用后必须调用 close() 关闭会话
-    
+    注意：使用后必须调用 close() 或 SessionLocal.remove() 关闭会话
+
     建议使用上下文管理器模式：
-    with get_db_session() as db:
+    with get_db_context() as db:
         # 使用 db
         pass
     """
@@ -101,12 +108,12 @@ class DBSessionManager:
         self.db = None
         self.retry_count = 0
         self.max_retries = 3
-    
+
     def __enter__(self):
-        # 创建新的数据库会话
+        # 创建新的数据库会话（scoped_session 会自动管理线程本地会话）
         self.db = SessionLocal()
         return self.db
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.db is not None:
             try:
@@ -146,9 +153,10 @@ class DBSessionManager:
                     pass
             finally:
                 try:
-                    self.db.close()
+                    # 使用 scoped_session 的 remove() 方法清理线程本地会话
+                    SessionLocal.remove()
                 except Exception as e:
-                    logger.error(f"关闭数据库会话失败: {e}", exc_info=True)
+                    logger.error(f"清理数据库会话失败: {e}", exc_info=True)
         return False  # 不抑制异常
 
 

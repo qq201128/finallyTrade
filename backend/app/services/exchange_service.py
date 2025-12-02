@@ -102,12 +102,12 @@ class ExchangeService:
             # 如果URL没有协议前缀，添加http://
             if not proxy_url.startswith(('http://', 'https://', 'socks5://', 'socks4://')):
                 proxy_url = f'http://{proxy_url}'
-                logger.info(f"自动添加协议前缀，代理URL: {proxy_url}")
+                # logger.info(f"自动添加协议前缀，代理URL: {proxy_url}")
             # 移除末尾斜杠，避免URL拼接问题
             proxy_url = proxy_url.rstrip('/')
             # 使用httpsProxy而不是proxy，避免URL拼接错误
             config['httpsProxy'] = proxy_url
-            logger.info(f"使用代理: {proxy_url}")
+            # logger.info(f"使用代理: {proxy_url}")
             return config
         
         # 优先级2: SOCKS代理
@@ -393,11 +393,11 @@ class ExchangeService:
             logger.error(f"获取 {symbol} 当前价格失败: {e}")
             return 0.0
     
-    def fetch_ohlcv(self, symbol: str, timeframe: str = '1h', 
+    def fetch_ohlcv(self, symbol: str, timeframe: str = '1h',
                    since: Optional[int] = None, limit: int = 100) -> List:
         """
         获取OHLCV数据
-        
+
         Args:
             symbol: 交易对
             timeframe: 时间周期，如 '1m', '5m', '1h', '1d'
@@ -409,6 +409,26 @@ class ExchangeService:
             return ohlcv
         except Exception as e:
             logger.error(f"获取 {symbol} OHLCV数据失败: {e}")
+            raise
+
+    async def fetch_ohlcv_async(self, symbol: str, timeframe: str = '1h',
+                                since: Optional[int] = None, limit: int = 100) -> List:
+        """
+        异步获取OHLCV数据
+
+        Args:
+            symbol: 交易对
+            timeframe: 时间周期，如 '1m', '5m', '1h', '1d'
+            since: 起始时间戳（毫秒）
+            limit: 返回数量限制
+        """
+        try:
+            ohlcv = await self._to_thread(
+                self.exchange.fetch_ohlcv, symbol, timeframe, since, limit
+            )
+            return ohlcv
+        except Exception as e:
+            logger.error(f"异步获取 {symbol} OHLCV数据失败: {e}")
             raise
     
     async def watch_ohlcv(self, symbol: str, timeframe: str = '1h'):

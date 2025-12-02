@@ -13,8 +13,9 @@ from app.models.user import User
 from app.api.auth import get_current_user
 from app.services.exchange_service import ExchangeService
 from app.core.config import settings
+from app.utils.timeframe import parse_timeframe, get_candle_start_timestamp
+from app.utils.pnl import calculate_margin_used, calculate_pnl_percentage, calculate_unrealized_pnl
 import logging
-import re
 import asyncio
 from threading import Lock
 import time
@@ -30,67 +31,28 @@ MAX_CACHE_SIZE = 1000  # 最大缓存条目数，防止内存溢出
 router = APIRouter(prefix="/api/trades", tags=["trades"])
 
 
-def _parse_timeframe(timeframe: str) -> int:
-    """解析时间周期字符串，返回秒数"""
-    match = re.match(r'(\d+)([smhd])', timeframe.lower())
-    if not match:
-        return 3600  # 默认1小时
-    
-    value = int(match.group(1))
-    unit = match.group(2)
-    
-    if unit == 's':
-        return value
-    elif unit == 'm':
-        return value * 60
-    elif unit == 'h':
-        return value * 3600
-    elif unit == 'd':
-        return value * 86400
-    else:
-        return 3600
+# 使用 utils 模块中的公共函数
+_parse_timeframe = parse_timeframe
+_get_candle_start_timestamp = get_candle_start_timestamp
 
 
-def _get_candle_start_timestamp(timestamp: datetime, timeframe: str) -> datetime:
-    """获取K线周期的开始时间戳"""
-    seconds = _parse_timeframe(timeframe)
-    unix_timestamp = int(timestamp.timestamp())
-    candle_start = unix_timestamp // seconds * seconds
-    return datetime.fromtimestamp(candle_start)
+def _calculate_margin_used_for_position(position: Position) -> Optional[float]:
+    """计算持仓占用的保证金（包装函数）"""
+    return calculate_margin_used(
+        position.entry_price or 0,
+        position.size or 0,
+        position.leverage or 1
+    )
 
 
-def _calculate_margin_used(position: Position) -> Optional[float]:
-    """计算持仓占用的保证金（名义价值 / 杠杆）"""
-    entry_price = position.entry_price or 0
-    size = abs(position.size or 0)
-    leverage = position.leverage or 1
-    if leverage <= 0:
-        leverage = 1
-    if entry_price <= 0 or size <= 0:
-        return None
-    # 保证金 = 名义价值 / 杠杆
-    notional = entry_price * size
-    margin = notional / leverage
-    return margin
-
-
-def _calculate_pnl_percentage(position: Position) -> Optional[float]:
-    """计算未实现盈亏百分比（基于保证金）"""
-    entry_price = position.entry_price or 0
-    size = abs(position.size or 0)
-    unrealized = position.unrealized_pnl
-    leverage = position.leverage or 1
-    if leverage <= 0:
-        leverage = 1
-    if entry_price <= 0 or size <= 0:
-        return None
-    # 计算保证金
-    notional = entry_price * size
-    margin_used = notional / leverage
-    # 盈亏百分比 = (未实现盈亏 / 保证金) * 100
-    if margin_used > 0 and unrealized is not None:
-        return (unrealized / margin_used) * 100
-    return None
+def _calculate_pnl_percentage_for_position(position: Position) -> Optional[float]:
+    """计算未实现盈亏百分比（包装函数）"""
+    return calculate_pnl_percentage(
+        position.entry_price or 0,
+        position.size or 0,
+        position.unrealized_pnl,
+        position.leverage or 1
+    )
 
 
 class PositionResponse(BaseModel):
@@ -234,12 +196,14 @@ async def get_positions(
                 else:
                     position.unrealized_pnl = (position.entry_price - current_price) * qty
             
-            position.margin_used = _calculate_margin_used(position)
-            position.pnl_percentage = _calculate_pnl_percentage(position)
-        
+            position.margin_used = _calculate_margin_used_for_position(position)
+            position.pnl_percentage = _calculate_pnl_percentage_for_position(position)
+
         # 后台异步更新价格（不阻塞响应）
-        asyncio.create_task(_update_prices_async(positions, db))
-        
+        # 先提取持仓ID，避免异步任务中访问已脱离Session的ORM对象
+        position_ids = [pos.id for pos in positions]
+        asyncio.create_task(_update_prices_async(position_ids))
+
         return positions
     
     # 完整模式：等待所有价格获取完成（用于手动刷新）
@@ -315,16 +279,16 @@ async def get_positions(
     return positions
 
 
-async def _update_prices_async(positions: List[Position], db: Session):
+async def _update_prices_async(position_ids: List[int]):
     """后台异步更新价格（不阻塞主请求）"""
     # 创建新的数据库会话，因为原会话可能已关闭
     from app.core.database import SessionLocal
     new_db = SessionLocal()
     try:
-        # 获取持仓ID列表
-        position_ids = [pos.id for pos in positions]
-        
-        # 重新查询持仓（使用新的会话）
+        if not position_ids:
+            return
+
+        # 使用新会话查询持仓
         positions_to_update = new_db.query(Position).filter(
             Position.id.in_(position_ids)
         ).all()
@@ -673,6 +637,175 @@ async def get_total_realized_pnl(
     return {"total_realized_pnl": float(total)}
 
 
+async def _get_close_price(
+    position: Position,
+    user_strategy: UserStrategy
+) -> float:
+    """获取平仓价格"""
+    current_price = position.current_price
+    if current_price and current_price > 0:
+        return current_price
+
+    try:
+        exchange_service = ExchangeService(
+            exchange_name=user_strategy.exchange,
+            api_key=user_strategy.api_key,
+            api_secret=user_strategy.api_secret
+        )
+        current_price = await exchange_service.get_ticker_price_async(
+            position.symbol,
+            use_cache=False,
+            cache_ttl=settings.CACHE_TICKER_TTL
+        )
+        if current_price > 0:
+            position.current_price = current_price
+            return current_price
+    except Exception as e:
+        logger.error(f"获取当前价格失败: {e}")
+
+    return position.entry_price
+
+
+def _create_simulated_close_order(
+    position: Position,
+    current_price: float,
+    db: Session
+) -> Order:
+    """创建模拟平仓订单"""
+    order = Order(
+        user_id=position.user_id,
+        position_id=position.id,
+        exchange_order_id=f"SIM_{datetime.now().timestamp()}",
+        symbol=position.symbol,
+        side=OrderSide.SELL,
+        type=OrderType.MARKET,
+        amount=position.size,
+        price=current_price,
+        filled=position.size,
+        cost=current_price * position.size,
+        status=OrderStatus.FILLED,
+        filled_at=datetime.now()
+    )
+    db.add(order)
+    return order
+
+
+def _close_position_and_record_pnl(
+    position: Position,
+    user_strategy: UserStrategy,
+    current_price: float,
+    db: Session
+) -> float:
+    """关闭持仓并记录盈亏"""
+    position_size = position.size
+    entry_price = position.entry_price
+
+    # 计算已实现盈亏
+    realized_pnl = (current_price - entry_price) * position_size
+
+    # 关闭持仓
+    position.is_open = False
+    position.size = 0
+    position.closed_at = datetime.now()
+
+    # 记录平仓时的K线周期时间戳
+    timeframe = user_strategy.timeframe if user_strategy.timeframe else '1h'
+    close_candle_timestamp = _get_candle_start_timestamp(datetime.now(), timeframe)
+
+    # 保存到用户策略配置中
+    if not user_strategy.config:
+        user_strategy.config = {}
+    if 'last_close_candle_times' not in user_strategy.config:
+        user_strategy.config['last_close_candle_times'] = {}
+    user_strategy.config['last_close_candle_times'][position.symbol] = close_candle_timestamp.isoformat()
+
+    # 创建盈亏记录
+    effective_leverage = position.leverage or 1
+    if effective_leverage <= 0:
+        effective_leverage = 1
+
+    pnl_record = PnLRecord(
+        user_id=position.user_id,
+        user_strategy_id=position.user_strategy_id,
+        position_id=position.id,
+        symbol=position.symbol,
+        entry_price=entry_price,
+        exit_price=current_price,
+        size=position_size,
+        realized_pnl=realized_pnl,
+        pnl_percentage=(
+            (realized_pnl / (entry_price * position_size)) * effective_leverage * 100
+            if entry_price > 0 and position_size > 0 else 0
+        )
+    )
+    db.add(pnl_record)
+
+    return realized_pnl
+
+
+async def _push_close_position_update(position: Position, current_price: float):
+    """推送平仓更新到 WebSocket"""
+    try:
+        from app.api.websocket import manager
+        position_data = {
+            "id": position.id,
+            "symbol": position.symbol,
+            "side": position.side,
+            "size": 0,
+            "entry_price": position.entry_price,
+            "current_price": current_price,
+            "unrealized_pnl": 0,
+            "leverage": position.leverage or 1,
+            "margin_used": 0,
+            "pnl_percentage": 0,
+            "is_open": False
+        }
+        message = {"type": "positions", "data": [position_data]}
+
+        for connection in manager.active_connections:
+            connection_user_id = manager.connection_users.get(connection)
+            if connection_user_id == position.user_id:
+                try:
+                    await manager.send_personal_message(message, connection)
+                except Exception as e:
+                    logger.debug(f"推送平仓更新失败: {e}")
+    except Exception as e:
+        logger.warning(f"推送 WebSocket 更新失败: {e}")
+
+
+def _create_real_close_order(
+    position: Position,
+    user_strategy: UserStrategy,
+    db: Session
+) -> Order:
+    """创建实际平仓订单"""
+    exchange_service = ExchangeService(
+        exchange_name=user_strategy.exchange,
+        api_key=user_strategy.api_key,
+        api_secret=user_strategy.api_secret
+    )
+
+    exchange_order = exchange_service.create_order(
+        symbol=position.symbol,
+        side='sell',
+        order_type='market',
+        amount=position.size
+    )
+
+    order = Order(
+        user_id=position.user_id,
+        position_id=position.id,
+        exchange_order_id=exchange_order.get('id'),
+        symbol=position.symbol,
+        side=OrderSide.SELL,
+        type=OrderType.MARKET,
+        amount=position.size,
+        status=OrderStatus.PENDING
+    )
+    db.add(order)
+    return order
+
+
 @router.post("/positions/{position_id}/close")
 async def close_position(
     position_id: int,
@@ -686,174 +819,43 @@ async def close_position(
         Position.user_id == current_user.id,
         Position.is_open == True
     ).first()
-    
+
     if not position:
         raise HTTPException(status_code=404, detail="持仓不存在或已平仓")
-    
+
     # 获取用户策略配置
     user_strategy = db.query(UserStrategy).filter(
         UserStrategy.id == position.user_strategy_id
     ).first()
-    
+
     if not user_strategy:
         raise HTTPException(status_code=404, detail="策略配置不存在")
-    
+
     try:
         # 获取当前价格
-        current_price = position.current_price
-        if not current_price or current_price <= 0:
-            # 如果当前价格不可用，尝试从交易所获取
-            try:
-                exchange_service = ExchangeService(
-                    exchange_name=user_strategy.exchange,
-                    api_key=user_strategy.api_key,
-                    api_secret=user_strategy.api_secret
-                )
-                current_price = await exchange_service.get_ticker_price_async(
-                    position.symbol,
-                    use_cache=False,
-                    cache_ttl=settings.CACHE_TICKER_TTL
-                )
-                if current_price > 0:
-                    position.current_price = current_price
-            except Exception as e:
-                logger.error(f"获取当前价格失败: {e}")
-                # 如果无法获取价格，使用开仓价（模拟平仓）
-                current_price = position.entry_price
-        
-        # 如果是模拟模式，直接创建已成交订单并关闭持仓
+        current_price = await _get_close_price(position, user_strategy)
+
+        # 模拟模式
         if user_strategy.is_simulated:
-            # 保存原始持仓数量
             position_size = position.size
-            entry_price = position.entry_price
-            
             logger.info(f"[模拟模式] 手动平仓: {position.symbol}, 数量: {position_size}, 价格: {current_price}")
-            
-            # 创建模拟订单
-            order = Order(
-                user_id=position.user_id,
-                position_id=position.id,
-                exchange_order_id=f"SIM_{datetime.now().timestamp()}",
-                symbol=position.symbol,
-                side=OrderSide.SELL,
-                type=OrderType.MARKET,
-                amount=position_size,
-                price=current_price,
-                filled=position_size,
-                cost=current_price * position_size,
-                status=OrderStatus.FILLED,
-                filled_at=datetime.now()
-            )
-            db.add(order)
-            
-            # 计算已实现盈亏
-            realized_pnl = (current_price - entry_price) * position_size
-            
-            # 关闭持仓
-            position.is_open = False
-            position.size = 0
-            position.closed_at = datetime.now()
-            
-            # 记录平仓时的K线周期时间戳，用于防止同一周期内立即开仓
-            timeframe = user_strategy.timeframe if user_strategy.timeframe else '1h'
-            close_candle_timestamp = _get_candle_start_timestamp(datetime.now(), timeframe)
-            
-            # 保存到用户策略配置中
-            if not user_strategy.config:
-                user_strategy.config = {}
-            if 'last_close_candle_times' not in user_strategy.config:
-                user_strategy.config['last_close_candle_times'] = {}
-            user_strategy.config['last_close_candle_times'][position.symbol] = close_candle_timestamp.isoformat()
-            
-            # 创建盈亏记录
-            effective_leverage = position.leverage or 1
-            if effective_leverage <= 0:
-                effective_leverage = 1
-            
-            pnl_record = PnLRecord(
-                user_id=position.user_id,
-                user_strategy_id=position.user_strategy_id,
-                position_id=position.id,
-                symbol=position.symbol,
-                entry_price=entry_price,
-                exit_price=current_price,
-                size=position_size,
-                realized_pnl=realized_pnl,
-                pnl_percentage=(
-                    (realized_pnl / (entry_price * position_size)) * effective_leverage * 100
-                    if entry_price > 0 and position_size > 0 else 0
-                )
-            )
-            db.add(pnl_record)
+
+            order = _create_simulated_close_order(position, current_price, db)
+            realized_pnl = _close_position_and_record_pnl(position, user_strategy, current_price, db)
             db.commit()
-            
-            # 推送 WebSocket 更新：通知前端持仓已关闭
-            try:
-                from app.api.websocket import manager
-                # 发送已关闭的持仓信息（is_open=False）
-                position_data = {
-                    "id": position.id,
-                    "symbol": position.symbol,
-                    "side": position.side,
-                    "size": 0,
-                    "entry_price": position.entry_price,
-                    "current_price": current_price,
-                    "unrealized_pnl": 0,
-                    "leverage": position.leverage or 1,
-                    "margin_used": 0,
-                    "pnl_percentage": 0,
-                    "is_open": False
-                }
-                message = {
-                    "type": "positions",
-                    "data": [position_data]
-                }
-                # 发送给该用户的所有连接
-                for connection in manager.active_connections:
-                    connection_user_id = manager.connection_users.get(connection)
-                    if connection_user_id == position.user_id:
-                        try:
-                            await manager.send_personal_message(message, connection)
-                        except Exception as e:
-                            logger.debug(f"推送平仓更新失败: {e}")
-            except Exception as e:
-                logger.warning(f"推送 WebSocket 更新失败: {e}")
-            
-            logger.info(f"[模拟模式] 平仓完成: 持仓 {position.id}, 盈亏: {realized_pnl}, 记录K线周期: {close_candle_timestamp}")
+
+            await _push_close_position_update(position, current_price)
+
+            logger.info(f"[模拟模式] 平仓完成: 持仓 {position.id}, 盈亏: {realized_pnl}")
             return {"message": "平仓成功", "order_id": order.id, "realized_pnl": realized_pnl}
-        
-        # 实际模式：创建市价平仓订单
-        exchange_service = ExchangeService(
-            exchange_name=user_strategy.exchange,
-            api_key=user_strategy.api_key,
-            api_secret=user_strategy.api_secret
-        )
-        
-        # 创建市价卖出订单
-        exchange_order = exchange_service.create_order(
-            symbol=position.symbol,
-            side='sell',
-            order_type='market',
-            amount=position.size
-        )
-        
-        # 创建订单记录
-        order = Order(
-            user_id=position.user_id,
-            position_id=position.id,
-            exchange_order_id=exchange_order.get('id'),
-            symbol=position.symbol,
-            side=OrderSide.SELL,
-            type=OrderType.MARKET,
-            amount=position.size,
-            status=OrderStatus.PENDING
-        )
-        db.add(order)
+
+        # 实际模式
+        order = _create_real_close_order(position, user_strategy, db)
         db.commit()
-        
-        logger.info(f"创建平仓订单: {order.id}, 交易所订单ID: {exchange_order.get('id')}")
+
+        logger.info(f"创建平仓订单: {order.id}, 交易所订单ID: {order.exchange_order_id}")
         return {"message": "平仓订单已创建", "order_id": order.id}
-        
+
     except Exception as e:
         db.rollback()
         logger.error(f"平仓失败: {e}", exc_info=True)

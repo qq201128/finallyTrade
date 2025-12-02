@@ -35,3 +35,4 @@ logs/
 .gitignore
 backend/trading_system.db-shm
 backend/trading_system.db-wal
+.claude/settings.local.json
