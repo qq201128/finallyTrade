@@ -8,6 +8,11 @@
 - 每增加4次盈利，补仓次数+1，补仓数量为对应盈利持仓开仓量的一半
 - 趋势出现反转（盈利转亏或亏转盈）时，自动清空所有统计与补仓机会
 
+补仓逻辑说明：
+- 补仓额度单位是 USDT（保证金），不是币的数量
+- 生成补仓额度：盈利平仓时，补仓额度 = 该笔持仓保证金 × 0.5
+- 执行补仓：币数量 = 补仓额度(USDT) × 杠杆 / 当前价格
+
 注意：使用此策略需要在前端配置中开启"双向交易"选项。
 """
 import logging
@@ -245,7 +250,7 @@ def _record_win(side: str, position_size: float, user_strategy, db):
         # 记录当前方向的盈利次数
         state[side]['wins'] = state[side].get('wins', 0) + 1
         wins_count = state[side]['wins']
-        logger.info(f"[盈利记录] 方向: {side}, 盈利次数: {wins_count}, 持仓数量: {position_size}")
+        logger.info(f"[盈利记录] 方向: {side}, 盈利次数: {wins_count}, 保证金: {position_size}")
 
         # 每4次盈利为相反方向生成补仓额度
         # 注意：先生成补仓额度，再保存状态（一次性保存所有修改）
@@ -255,7 +260,8 @@ def _record_win(side: str, position_size: float, user_strategy, db):
                 if 'replenish_pool' not in state[opposite]:
                     state[opposite]['replenish_pool'] = []
                 state[opposite]['replenish_pool'].append(replenish_amount)
-                logger.info(f"[补仓额度生成] {side}方向盈利{wins_count}次，为{opposite}方向生成补仓额度: {replenish_amount}, "
+                logger.info(f"[补仓额度生成] {side}方向盈利{wins_count}次，"
+                          f"为{opposite}方向生成补仓额度: {replenish_amount} USDT, "
                           f"{opposite}方向当前补仓池: {state[opposite]['replenish_pool']}")
 
         # 统一保存状态（包括盈利计数和补仓额度）
@@ -523,7 +529,7 @@ class BidirectionalExampleStrategy(BaseStrategy):
             if pnl_percentage >= 50:
                 return {
                     'price': current_price,
-                    'reason': 'take_profit_50pct',
+                    'reason': f'take_profit_{pnl_percentage}pct',
                     'reduce_percent': 1.0  # 全部平仓
                 }
             
@@ -638,10 +644,10 @@ class BidirectionalExampleStrategy(BaseStrategy):
                     opposite_wins = state[opposite_side].get('wins', 0)
 
                     # 补仓检查日志（INFO级别，方便调试）
-                    logger.info(f"[补仓检查] 持仓ID: {position_id}, 方向: {position_side}, "
-                              f"当前价: {current_price}, 入场价: {position.entry_price}, ROI: {roi:.4f}, "
-                              f"亏损: {roi < 0}, 补仓池: {len(replenish_pool)}个额度, "
-                              f"{opposite_side}方向盈利次数: {opposite_wins}")
+                    # logger.info(f"[补仓检查] 持仓ID: {position_id}, 方向: {position_side}, "
+                    #           f"当前价: {current_price}, 入场价: {position.entry_price}, ROI: {roi:.4f}, "
+                    #           f"亏损: {roi < 0}, 补仓池: {len(replenish_pool)}个额度, "
+                    #           f"{opposite_side}方向盈利次数: {opposite_wins}")
 
                     if roi < 0 and replenish_pool:
                         amount = replenish_pool.pop(0)
@@ -660,7 +666,7 @@ class BidirectionalExampleStrategy(BaseStrategy):
                             }
                     elif roi < 0 and not replenish_pool:
                         # 亏损但无补仓额度
-                        logger.info(f"[补仓未触发] 持仓ID: {position_id}, 方向: {position_side}, "
+                        logger.debug(f"[补仓未触发] 持仓ID: {position_id}, 方向: {position_side}, "
                                      f"亏损但无补仓额度。需要{opposite_side}方向盈利平仓4次才能生成补仓额度")
                 except Exception as e:
                     logger.debug(f"无法获取策略状态，user_strategy 可能已过期: {e}")
