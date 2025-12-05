@@ -149,28 +149,29 @@ export default {
   align-items: center;
   font-size: 28px;
   font-weight: 600;
-  color: #303133;
+  color: var(--apple-text-primary, #fff);
   margin: 0 0 8px 0;
+  letter-spacing: -0.5px;
 }
 
 .page-subtitle {
-  color: #909399;
+  color: var(--apple-text-secondary, rgba(255, 255, 255, 0.7));
   font-size: 14px;
   margin: 0;
 }
 
 .profit {
-  color: #67c23a;
+  color: var(--apple-green, #30d158) !important;
   font-weight: bold;
 }
 
 .loss {
-  color: #f56c6c;
+  color: var(--apple-red, #ff453a) !important;
   font-weight: bold;
 }
 
 :deep(.el-table) {
-  border-radius: 8px;
+  border-radius: 12px;
   overflow: hidden;
 }
 </style>

@@ -321,7 +321,8 @@ export default {
       'quick_test_strategy': '快速测试策略',
       'talib_example_strategy': 'TA-Lib示例策略',
       'aggressive_quant_strategy': '激进量化策略',
-      'bidirectional_example_strategy': '双向交易示例策略'
+      'bidirectional_example_strategy': '双向交易示例策略',
+      'grid_strategy': '网格交易策略'
     }
     
     const getStrategyDisplayName = (strategyName) => {
@@ -538,23 +539,24 @@ export default {
   align-items: center;
   font-size: 28px;
   font-weight: 600;
-  color: #303133;
+  color: var(--apple-text-primary, #fff);
   margin: 0 0 8px 0;
+  letter-spacing: -0.5px;
 }
 
 .page-subtitle {
-  color: #909399;
+  color: var(--apple-text-secondary, rgba(255, 255, 255, 0.7));
   font-size: 14px;
   margin: 0;
 }
 
 .profit {
-  color: #67c23a;
+  color: var(--apple-green, #30d158) !important;
   font-weight: bold;
 }
 
 .loss {
-  color: #f56c6c;
+  color: var(--apple-red, #ff453a) !important;
   font-weight: bold;
 }
 
@@ -564,15 +566,29 @@ export default {
 
 :deep(.el-tabs__header) {
   margin-bottom: 20px;
+  border-bottom: 1px solid var(--apple-separator, rgba(255, 255, 255, 0.1));
+}
+
+:deep(.el-tabs__nav-wrap::after) {
+  display: none;
 }
 
 :deep(.el-tabs__item) {
   font-weight: 500;
   font-size: 15px;
+  color: var(--apple-text-secondary, rgba(255, 255, 255, 0.7));
+}
+
+:deep(.el-tabs__item.is-active) {
+  color: var(--apple-text-primary, #fff);
+}
+
+:deep(.el-tabs__active-bar) {
+  background: var(--apple-accent, #0a84ff);
 }
 
 :deep(.el-table) {
-  border-radius: 8px;
+  border-radius: 12px;
   overflow: hidden;
 }
 </style>

@@ -479,19 +479,31 @@ class BidirectionalTradingEngine(BaseTradingEngine):
             self.db.add(pnl_record)
             self.db.commit()
             logger.info(f"关闭持仓: {position.id}, 方向: {position.side}, 盈亏: {realized_pnl}")
-            
+
             # 如果是盈利平仓，记录盈利次数（用于生成补仓额度）
             if realized_pnl > 0:
                 try:
                     from app.strategies.bidirectional_example_strategy import _record_win
-                    position_size = abs(position.size or order.filled or 0)
-                    if position_size > 0:
-                        _record_win(position.side, position_size, self.user_strategy, self.db)
-                except ImportError:
+                    # 计算该笔平仓对应的保证金（用于生成补仓额度）
+                    # 补仓额度 = 盈利持仓保证金的一半
+                    position_size = abs(order.filled or 0)
+                    leverage = position.leverage or 1
+                    if leverage <= 0:
+                        leverage = 1
+                    # 保证金 = 入场价 × 数量 / 杠杆
+                    margin_amount = (position.entry_price * position_size) / leverage if position.entry_price else 0
+
+                    if margin_amount > 0:
+                        logger.info(f"[盈利平仓] 记录盈利: 持仓ID={position.id}, 方向={position.side}, "
+                                   f"数量={position_size}, 保证金={margin_amount:.4f}, 盈亏={realized_pnl}")
+                        _record_win(position.side, margin_amount, self.user_strategy, self.db)
+                except ImportError as e:
                     # 如果不是双向交易策略，跳过
-                    pass
+                    logger.debug(f"导入 _record_win 失败: {e}")
                 except Exception as e:
-                    logger.debug(f"记录盈利失败: {e}")
+                    logger.warning(f"记录盈利失败: {e}", exc_info=True)
+            else:
+                logger.info(f"[亏损平仓] 持仓ID={position.id}, 方向={position.side}, 盈亏={realized_pnl}, 不记录盈利")
             
             # 如果持仓已完全关闭，推送 WebSocket 更新通知前端
             if position_was_closed:
@@ -500,16 +512,20 @@ class BidirectionalTradingEngine(BaseTradingEngine):
             logger.error(f"关闭持仓失败: {e}")
             self.db.rollback()
 
-    def adjust_position_size(self, position: Position):
+    def adjust_position_size(self, position: Position, current_price: float = None):
         """
         仓位调整（支持双向补仓）
+
+        Args:
+            position: 持仓对象
+            current_price: 当前价格（可选，如果不传则尝试从持仓获取）
         """
         position_adjustment_enabled = self.user_strategy.config.get('position_adjustment', False)
         if not position_adjustment_enabled:
             logger.debug(f"[仓位调整] 持仓ID: {position.id if position else 'N/A'}, "
                         f"仓位调整功能未启用 (position_adjustment={position_adjustment_enabled})")
             return
-        
+
         # 检查 position 是否仍然存在于数据库中
         try:
             # 尝试刷新 position 对象，如果已被删除会抛出异常
@@ -517,12 +533,20 @@ class BidirectionalTradingEngine(BaseTradingEngine):
         except Exception as e:
             logger.warning(f"持仓 {position.id if position else 'N/A'} 已不存在于数据库中，跳过仓位调整: {e}")
             return
-        
+
         # 再次检查 position 是否仍然开放
         if not position.is_open:
             logger.debug(f"持仓 {position.id} 已关闭，跳过仓位调整")
             return
-        
+
+        # 如果传入了当前价格，更新持仓的 current_price
+        if current_price and current_price > 0:
+            position.current_price = current_price
+            try:
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+
         try:
             adjustment = self.call_strategy_callback('adjust_position', position, self.db, self.user_strategy)
             logger.debug(f"[仓位调整] 持仓ID: {position.id}, 策略返回: {adjustment}")
@@ -550,7 +574,41 @@ class BidirectionalTradingEngine(BaseTradingEngine):
                         adjust_side = OrderSide.SELL
                     
                     if self.user_strategy.is_simulated:
-                        logger.info(f"[模拟模式] 仓位调整: {position.side}方向追加 {amount} {position.symbol}")
+                        # 获取当前价格（用于模拟成交）
+                        fill_price = current_price or position.current_price or position.entry_price
+                        if not fill_price or fill_price <= 0:
+                            logger.warning(f"[模拟模式] 仓位调整失败: 无法获取有效价格，持仓ID: {position.id}")
+                            return
+
+                        # amount 是保证金（USDT），需要转换为币的数量
+                        # 币数量 = 保证金 × 杠杆 / 当前价格
+                        leverage = position.leverage or 1
+                        if leverage <= 0:
+                            leverage = 1
+                        coin_amount = (amount * leverage) / fill_price
+
+                        logger.info(f"[模拟模式] 仓位调整: {position.side}方向追加保证金 {amount} USDT，"
+                                  f"杠杆={leverage}x，成交价={fill_price}，转换为币数量={coin_amount:.4f}")
+
+                        # 更新持仓：计算新的平均入场价和总数量
+                        old_size = abs(position.size or 0)
+                        old_entry_price = position.entry_price or fill_price
+                        new_size = old_size + coin_amount
+
+                        # 计算新的平均入场价（加权平均）
+                        if new_size > 0:
+                            new_entry_price = (old_entry_price * old_size + fill_price * coin_amount) / new_size
+                        else:
+                            new_entry_price = fill_price
+
+                        logger.info(f"[模拟模式] 补仓计算: 原size={old_size:.4f}, 原入场价={old_entry_price:.6f}, "
+                                  f"补仓量={coin_amount:.4f}, 补仓价={fill_price:.6f}, 新size={new_size:.4f}, 新入场价={new_entry_price:.6f}")
+
+                        # 更新持仓数据
+                        position.size = new_size
+                        position.entry_price = new_entry_price
+
+                        # 创建补仓订单（记录币的数量）
                         order = Order(
                             user_id=position.user_id,
                             position_id=position.id,
@@ -558,12 +616,25 @@ class BidirectionalTradingEngine(BaseTradingEngine):
                             symbol=position.symbol,
                             side=adjust_side,
                             type=OrderType.MARKET,
-                            amount=amount,
+                            amount=coin_amount,  # 币的数量
+                            filled=coin_amount,  # 模拟模式立即全部成交
+                            price=fill_price,
+                            cost=amount,  # 保证金（USDT）
                             status=OrderStatus.FILLED
                         )
                         self.db.add(order)
-                        self.db.commit()
-                        logger.info(f"[模拟模式] 仓位调整订单已创建: {order.id}")
+
+                        # 提交数据库更改
+                        try:
+                            self.db.commit()
+                            # 刷新 position 对象以确认更改已保存
+                            self.db.refresh(position)
+                            logger.info(f"[模拟模式] 仓位调整完成: 持仓ID={position.id}, "
+                                      f"数据库中size={position.size:.4f}, 数据库中入场价={position.entry_price:.6f}")
+                        except Exception as commit_error:
+                            logger.error(f"[模拟模式] 提交数据库失败: {commit_error}")
+                            self.db.rollback()
+                            raise
                     else:
                         exchange_order = self.exchange_service.create_order(
                             symbol=position.symbol,
@@ -886,6 +957,11 @@ class BidirectionalTradingEngine(BaseTradingEngine):
 
                     analysis_result = self.analyze_strategy(symbol, dataframe)
 
+                    # 获取当前价格（从 K 线数据的最新收盘价）
+                    current_price = None
+                    if dataframe is not None and not dataframe.empty:
+                        current_price = float(dataframe['close'].iloc[-1])
+
                     self.verify_and_close_positions(symbol, analysis_result)
 
                     # 从预先获取的持仓映射中获取当前 symbol 的持仓
@@ -895,10 +971,10 @@ class BidirectionalTradingEngine(BaseTradingEngine):
                         if pos.is_open
                     ]
 
-                    # 对当前 symbol 的持仓进行仓位调整
+                    # 对当前 symbol 的持仓进行仓位调整（传入最新价格）
                     for position in current_positions:
                         try:
-                            self.adjust_position_size(position)
+                            self.adjust_position_size(position, current_price)
                         except Exception as e:
                             logger.error(f"调整持仓 {position.id if position else 'N/A'} 失败: {e}")
                             continue

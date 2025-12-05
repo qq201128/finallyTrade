@@ -183,7 +183,7 @@ export default {
   left: 0;
   right: 0;
   bottom: 0;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: var(--apple-bg-primary, #000);
   z-index: 0;
 }
 
@@ -197,55 +197,55 @@ export default {
 .shape {
   position: absolute;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(10, 132, 255, 0.08);
   animation: float 20s infinite;
 }
 
 .shape-1 {
-  width: 300px;
-  height: 300px;
-  top: -100px;
-  left: -100px;
+  width: 400px;
+  height: 400px;
+  top: -150px;
+  left: -150px;
   animation-delay: 0s;
 }
 
 .shape-2 {
-  width: 200px;
-  height: 200px;
-  bottom: -50px;
-  right: -50px;
+  width: 300px;
+  height: 300px;
+  bottom: -100px;
+  right: -100px;
+  background: rgba(48, 209, 88, 0.06);
   animation-delay: 5s;
 }
 
 .shape-3 {
-  width: 150px;
-  height: 150px;
-  top: 50%;
-  right: 10%;
+  width: 200px;
+  height: 200px;
+  top: 40%;
+  right: 15%;
+  background: rgba(191, 90, 242, 0.05);
   animation-delay: 10s;
 }
 
 @keyframes float {
   0%, 100% {
-    transform: translate(0, 0) rotate(0deg);
+    transform: translate(0, 0) scale(1);
   }
-  33% {
-    transform: translate(30px, -30px) rotate(120deg);
-  }
-  66% {
-    transform: translate(-20px, 20px) rotate(240deg);
+  50% {
+    transform: translate(30px, -30px) scale(1.1);
   }
 }
 
 .register-card {
-  width: 420px;
+  width: 400px;
   max-width: 100%;
   position: relative;
   z-index: 1;
-  border: none;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-  backdrop-filter: blur(10px);
-  background: rgba(255, 255, 255, 0.95);
+  background: var(--apple-bg-secondary, #1c1c1e) !important;
+  border: 1px solid var(--apple-separator, rgba(255, 255, 255, 0.1)) !important;
+  border-radius: 20px !important;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+  backdrop-filter: saturate(180%) blur(20px);
 }
 
 .card-header {
@@ -254,66 +254,92 @@ export default {
 }
 
 .header-icon {
-  color: #667eea;
+  color: var(--apple-accent, #0a84ff);
   margin-bottom: 12px;
 }
 
 .card-header h2 {
   margin: 0 0 8px 0;
-  color: #303133;
+  color: var(--apple-text-primary, #fff);
   font-size: 24px;
   font-weight: 600;
+  letter-spacing: -0.5px;
 }
 
 .header-subtitle {
   margin: 0;
-  color: #909399;
+  color: var(--apple-text-secondary, rgba(255, 255, 255, 0.7));
   font-size: 14px;
 }
 
 .register-form {
-  margin-top: 30px;
+  margin-top: 24px;
 }
 
 .register-form :deep(.el-form-item) {
-  margin-bottom: 24px;
+  margin-bottom: 20px;
 }
 
 .register-form :deep(.el-input__wrapper) {
   padding: 12px 15px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  background: var(--apple-bg-tertiary, #2c2c2e) !important;
+  border: 1px solid var(--apple-separator, rgba(255, 255, 255, 0.1));
+  border-radius: 12px;
+  box-shadow: none !important;
+}
+
+.register-form :deep(.el-input__wrapper:hover) {
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.register-form :deep(.el-input__wrapper.is-focus) {
+  border-color: var(--apple-accent, #0a84ff) !important;
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.2) !important;
+}
+
+.register-form :deep(.el-input__inner) {
+  color: var(--apple-text-primary, #fff);
+}
+
+.register-form :deep(.el-input__inner::placeholder) {
+  color: var(--apple-text-tertiary, rgba(255, 255, 255, 0.5));
+}
+
+.register-form :deep(.el-input__prefix) {
+  color: var(--apple-text-tertiary, rgba(255, 255, 255, 0.5));
 }
 
 .register-button {
   width: 100%;
-  height: 44px;
+  height: 48px;
   font-size: 16px;
   font-weight: 600;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  border: none;
+  background: var(--apple-accent, #0a84ff) !important;
+  border: none !important;
+  border-radius: 12px !important;
+  transition: all 0.2s ease;
 }
 
 .register-button:hover {
-  background: linear-gradient(135deg, #5568d3 0%, #6a3f8f 100%);
-  transform: translateY(-2px);
-  box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4);
+  background: var(--apple-accent-hover, #409eff) !important;
+  transform: scale(1.02);
 }
 
 .login-link {
   text-align: center;
   margin-top: 20px;
-  color: #909399;
+  color: var(--apple-text-secondary, rgba(255, 255, 255, 0.7));
   font-size: 14px;
 }
 
 .link-button {
-  color: #667eea;
+  color: var(--apple-accent, #0a84ff) !important;
   font-weight: 500;
   padding: 0 4px;
 }
 
 .link-button:hover {
-  color: #5568d3;
+  color: var(--apple-accent-hover, #409eff) !important;
 }
 </style>
 

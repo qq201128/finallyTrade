@@ -18,8 +18,13 @@ from app.strategies.base_strategy import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-def _get_strategy_state(user_strategy):
-    """从数据库配置中获取策略状态，如果不存在则初始化"""
+def _get_strategy_state(user_strategy, db=None):
+    """从数据库配置中获取策略状态，如果不存在则初始化
+
+    Args:
+        user_strategy: 用户策略对象
+        db: 数据库会话（可选，用于刷新对象以获取最新数据）
+    """
     if not user_strategy:
         return {
             'long': {
@@ -33,7 +38,15 @@ def _get_strategy_state(user_strategy):
                 'replenish_pool': []
             }
         }
-    
+
+    # 关键修复：刷新 user_strategy 对象以获取数据库中的最新数据
+    # 这解决了在同一会话中多次读写时，内存中对象与数据库不同步的问题
+    if db:
+        try:
+            db.refresh(user_strategy)
+        except Exception as e:
+            logger.debug(f"刷新 user_strategy 失败: {e}")
+
     # 安全地访问 user_strategy.config
     try:
         config = user_strategy.config
@@ -84,11 +97,11 @@ def _get_strategy_state(user_strategy):
 
     # 添加调试日志，显示从数据库读取的状态
     replenish_state = config['replenish_state']
-    logger.debug(f"[读取策略状态] 策略ID: {user_strategy.id if user_strategy else 'N/A'}, "
-                 f"long: wins={replenish_state['long'].get('wins', 0)}, "
-                 f"补仓池={len(replenish_state['long'].get('replenish_pool', []))}, "
-                 f"short: wins={replenish_state['short'].get('wins', 0)}, "
-                 f"补仓池={len(replenish_state['short'].get('replenish_pool', []))}")
+    logger.info(f"[读取策略状态] 策略ID: {user_strategy.id if user_strategy else 'N/A'}, "
+                f"long: wins={replenish_state['long'].get('wins', 0)}, "
+                f"补仓池={replenish_state['long'].get('replenish_pool', [])}, "
+                f"short: wins={replenish_state['short'].get('wins', 0)}, "
+                f"补仓池={replenish_state['short'].get('replenish_pool', [])}")
 
     return replenish_state
 
@@ -128,7 +141,7 @@ def _save_strategy_state(user_strategy, db):
             # 标记 config 字段为已修改（必须在修改后立即调用）
             flag_modified(user_strategy, 'config')
             
-            logger.debug(f"[保存策略状态] 策略ID: {strategy_id}, config: {user_strategy.config}")
+            logger.info(f"[保存策略状态] 策略ID: {strategy_id}, replenish_state: {user_strategy.config.get('replenish_state', {})}")
             
             # 先 flush 确保数据写入
             try:
@@ -176,7 +189,7 @@ def _save_strategy_state(user_strategy, db):
 
 def _reset_state(user_strategy, db):
     """重置策略状态"""
-    state = _get_strategy_state(user_strategy)
+    state = _get_strategy_state(user_strategy, db)
     for side in state.keys():
         state[side]['wins'] = 0
         state[side]['last_trend'] = None
@@ -185,29 +198,58 @@ def _reset_state(user_strategy, db):
 
 
 def _record_win(side: str, position_size: float, user_strategy, db):
-    """记录方向盈利，用于生成补仓机会"""
+    """记录方向盈利，用于生成补仓机会
+
+    策略逻辑：
+    1. 记录当前方向的盈利次数
+    2. 每4次盈利为对手方向生成1次补仓额度
+    3. 当某方向盈利平仓时，清零对手方向的盈利计数（趋势反转）
+    """
+    logger.info(f"[_record_win 调用] side={side}, position_size={position_size}, "
+                f"user_strategy={user_strategy.id if user_strategy else None}, db={db is not None}")
+
     if not user_strategy or not db:
+        logger.warning(f"[_record_win] 参数无效: user_strategy={user_strategy}, db={db}")
         return
-    
+
     try:
         # 检查 user_strategy 是否仍然有效
         _ = user_strategy.id
-    except Exception:
-        logger.debug("user_strategy 已过期，跳过记录盈利")
+    except Exception as e:
+        logger.warning(f"user_strategy 已过期，跳过记录盈利: {e}")
         return
-    
+
     try:
-        state = _get_strategy_state(user_strategy)
+        # 关键修复：确保直接操作 user_strategy.config 中的数据，而不是副本
+        # 先确保 config 和 replenish_state 已初始化
+        if not user_strategy.config:
+            user_strategy.config = {}
+        if 'replenish_state' not in user_strategy.config:
+            user_strategy.config['replenish_state'] = {
+                'long': {'wins': 0, 'last_trend': None, 'replenish_pool': []},
+                'short': {'wins': 0, 'last_trend': None, 'replenish_pool': []}
+            }
+
+        # 直接引用 config 中的 replenish_state，确保修改会反映到 config
+        state = user_strategy.config['replenish_state']
+        opposite = 'short' if side == 'long' else 'long'
+
+        # 趋势反转处理：当某方向盈利平仓时，清零对手方向的盈利计数
+        # 防止旧数据影响新趋势的判断
+        opposite_wins_before = state[opposite].get('wins', 0)
+        if opposite_wins_before > 0:
+            logger.info(f"[趋势反转] {side}方向盈利平仓，清零{opposite}方向的盈利计数 "
+                       f"(从 {opposite_wins_before} 次清零)")
+            state[opposite]['wins'] = 0
+
+        # 记录当前方向的盈利次数
         state[side]['wins'] = state[side].get('wins', 0) + 1
         wins_count = state[side]['wins']
         logger.info(f"[盈利记录] 方向: {side}, 盈利次数: {wins_count}, 持仓数量: {position_size}")
-        
-        # 每次盈利都保存状态，确保盈利次数不会丢失
-        _save_strategy_state(user_strategy, db)
-        
+
         # 每4次盈利为相反方向生成补仓额度
+        # 注意：先生成补仓额度，再保存状态（一次性保存所有修改）
         if wins_count % 4 == 0 and position_size:
-            opposite = 'short' if side == 'long' else 'long'
             replenish_amount = max(position_size * 0.5, 0)
             if replenish_amount > 0:
                 if 'replenish_pool' not in state[opposite]:
@@ -215,27 +257,49 @@ def _record_win(side: str, position_size: float, user_strategy, db):
                 state[opposite]['replenish_pool'].append(replenish_amount)
                 logger.info(f"[补仓额度生成] {side}方向盈利{wins_count}次，为{opposite}方向生成补仓额度: {replenish_amount}, "
                           f"{opposite}方向当前补仓池: {state[opposite]['replenish_pool']}")
-                _save_strategy_state(user_strategy, db)
+
+        # 统一保存状态（包括盈利计数和补仓额度）
+        logger.info(f"[准备保存] config['replenish_state'] = {user_strategy.config['replenish_state']}")
+        _save_strategy_state(user_strategy, db)
+
+        # 保存后验证
+        if wins_count % 4 == 0:
+            try:
+                db.refresh(user_strategy)
+                saved_pool = user_strategy.config.get('replenish_state', {}).get(opposite, {}).get('replenish_pool', [])
+                logger.info(f"[保存后验证] 数据库中的补仓池: {saved_pool}")
+            except Exception as e:
+                logger.warning(f"保存后验证失败: {e}")
     except Exception as e:
-        logger.debug(f"记录盈利失败: {e}")
+        logger.error(f"记录盈利失败: {e}", exc_info=True)
 
 
 def _update_trend_state(side: str, roi: float, user_strategy, db):
-    """监控趋势反转：盈利 -> 亏损 或 亏损 -> 盈利"""
+    """监控趋势状态，用于日志记录（不再重置补仓池）"""
     if roi is None:
         return
     if not user_strategy or not db:
         return
-    
+
     try:
         # 检查 user_strategy 是否仍然有效
         _ = user_strategy.id
     except Exception:
         logger.debug("user_strategy 已过期，跳过趋势状态更新")
         return
-    
+
     try:
-        state = _get_strategy_state(user_strategy)
+        # 关键修复：直接操作 user_strategy.config，而不是通过 _get_strategy_state 获取可能的副本
+        if not user_strategy.config:
+            user_strategy.config = {}
+        if 'replenish_state' not in user_strategy.config:
+            user_strategy.config['replenish_state'] = {
+                'long': {'wins': 0, 'last_trend': None, 'replenish_pool': []},
+                'short': {'wins': 0, 'last_trend': None, 'replenish_pool': []}
+            }
+
+        state = user_strategy.config['replenish_state']
+
         if roi > 0:
             trend = 'profit'
         elif roi < 0:
@@ -243,15 +307,14 @@ def _update_trend_state(side: str, roi: float, user_strategy, db):
         else:
             trend = 'flat'
         last = state[side].get('last_trend')
-        
-        # 重要：只有在真正发生趋势反转时才重置（从盈利转为亏损，或从亏损转为盈利）
-        # 但要注意：如果持仓一直亏损，不应该因为价格波动而重置状态
+
+        # 记录趋势变化（仅用于日志，不再重置状态）
+        # 补仓额度是通过盈利平仓积累的，不应该因为价格波动而丢失
         if last and trend in ('profit', 'loss') and trend != last:
-            logger.warning(f"[趋势反转] {side}方向从 {last} 转为 {trend}，重置所有状态（包括补仓池）")
-            _reset_state(user_strategy, db)
-            state = _get_strategy_state(user_strategy)  # 重新获取重置后的状态
-        
-        if trend in ('profit', 'loss'):
+            logger.info(f"[趋势变化] {side}方向从 {last} 转为 {trend}")
+
+        # 只有趋势真正变化时才保存（减少不必要的保存）
+        if trend in ('profit', 'loss') and state[side].get('last_trend') != trend:
             state[side]['last_trend'] = trend
             _save_strategy_state(user_strategy, db)
     except Exception as e:
@@ -455,19 +518,9 @@ class BidirectionalExampleStrategy(BaseStrategy):
             # 注意：亏损时不平仓，通过 adjust_position 进行补仓处理
             
             # 止盈：盈利超过保证金50%时平仓（考虑杠杆）
+            # 注意：_record_win 已在 trading_engine 的 _close_position_from_order 中调用
+            # 这里不再重复调用，避免盈利次数被重复计数
             if pnl_percentage >= 50:
-                if user_strategy and db:
-                    try:
-                        # 再次检查 user_strategy 是否仍然有效
-                        _ = user_strategy.id
-                        # 安全地访问 position.size
-                        try:
-                            pos_size = position.size
-                        except Exception:
-                            pos_size = position_size  # 使用之前获取的值
-                        _record_win(position_side, pos_size, user_strategy, db)
-                    except Exception as e:
-                        logger.debug(f"无法记录盈利，user_strategy 可能已过期: {e}")
                 return {
                     'price': current_price,
                     'reason': 'take_profit_50pct',
@@ -560,20 +613,36 @@ class BidirectionalExampleStrategy(BaseStrategy):
                 try:
                     # 再次检查 user_strategy 是否仍然有效
                     _ = user_strategy.id
-                    state = _get_strategy_state(user_strategy)
-                    replenish_pool = state[position_side].get('replenish_pool', [])
+
+                    # 关键修复：直接操作 user_strategy.config，而不是通过 _get_strategy_state 获取可能的副本
+                    if not user_strategy.config:
+                        user_strategy.config = {}
+                    if 'replenish_state' not in user_strategy.config:
+                        user_strategy.config['replenish_state'] = {
+                            'long': {'wins': 0, 'last_trend': None, 'replenish_pool': []},
+                            'short': {'wins': 0, 'last_trend': None, 'replenish_pool': []}
+                        }
+
+                    state = user_strategy.config['replenish_state']
+
+                    # 确保 replenish_pool 存在于 state 中
+                    if 'replenish_pool' not in state[position_side]:
+                        state[position_side]['replenish_pool'] = []
+
+                    # 直接引用 state 中的 replenish_pool，确保 pop 操作会修改原数据
+                    replenish_pool = state[position_side]['replenish_pool']
                     wins = state[position_side].get('wins', 0)
-                    
+
                     # 获取相反方向的盈利次数（用于生成补仓额度）
                     opposite_side = 'short' if position_side == 'long' else 'long'
                     opposite_wins = state[opposite_side].get('wins', 0)
-                    
-                    # 添加详细日志用于诊断（使用DEBUG级别，减少日志噪音）
-                    logger.debug(f"[补仓检查] 持仓ID: {position_id}, 方向: {position_side}, ROI: {roi:.4f}, "
+
+                    # 补仓检查日志（INFO级别，方便调试）
+                    logger.info(f"[补仓检查] 持仓ID: {position_id}, 方向: {position_side}, "
+                              f"当前价: {current_price}, 入场价: {position.entry_price}, ROI: {roi:.4f}, "
                               f"亏损: {roi < 0}, 补仓池: {len(replenish_pool)}个额度, "
-                              f"{opposite_side}方向盈利次数: {opposite_wins} (每4次为{position_side}生成1次补仓额度), "
-                              f"补仓池详情: {replenish_pool}")
-                    
+                              f"{opposite_side}方向盈利次数: {opposite_wins}")
+
                     if roi < 0 and replenish_pool:
                         amount = replenish_pool.pop(0)
                         amount = max(amount, 0)
@@ -589,11 +658,10 @@ class BidirectionalExampleStrategy(BaseStrategy):
                                 'should_adjust': True,
                                 'amount': amount
                             }
-                    elif roi < 0:
-                        # 亏损但无补仓额度是正常情况，使用DEBUG级别
-                        logger.debug(f"[补仓未触发] 持仓ID: {position_id}, 方向: {position_side}, "
-                                     f"亏损但无补仓额度。{opposite_side}方向盈利次数: {opposite_wins}, "
-                                     f"需要{opposite_side}方向盈利平仓4次才能为{position_side}方向生成1次补仓额度")
+                    elif roi < 0 and not replenish_pool:
+                        # 亏损但无补仓额度
+                        logger.info(f"[补仓未触发] 持仓ID: {position_id}, 方向: {position_side}, "
+                                     f"亏损但无补仓额度。需要{opposite_side}方向盈利平仓4次才能生成补仓额度")
                 except Exception as e:
                     logger.debug(f"无法获取策略状态，user_strategy 可能已过期: {e}")
             

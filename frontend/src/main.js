@@ -4,6 +4,7 @@ import router from './router'
 import store from './store'
 import ElementPlus from 'element-plus'
 import 'element-plus/dist/index.css'
+import 'element-plus/theme-chalk/dark/css-vars.css'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 
 // 抑制 ResizeObserver 警告（这是一个已知的浏览器警告，不影响功能）
@@ -42,6 +43,10 @@ window.addEventListener('unhandledrejection', (event) => {
     return false
   }
 })
+
+// 主题初始化：从 localStorage 读取，默认深色
+const savedTheme = localStorage.getItem('theme') || 'dark'
+document.documentElement.classList.add(savedTheme)
 
 const app = createApp(App)
 
